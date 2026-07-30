@@ -48,7 +48,7 @@
         <central-publishing-maven-plugin.version>0.11.0</central-publishing-maven-plugin.version>
         <jspecify.version>1.0.0</jspecify.version>
         <junit-jupiter.version>5.10.2</junit-jupiter.version>
-        <log4j.version>2.25.1</log4j.version>
+        <log4j.version>2.26.1</log4j.version>
         <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
         <maven-gpg-plugin.version>3.2.4</maven-gpg-plugin.version>
         <maven-jar-plugin.version>3.4.2</maven-jar-plugin.version>
