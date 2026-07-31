@@ -2,16 +2,21 @@ package net.mezzdev.filewatcher;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.jspecify.annotations.Nullable;
 
 import java.io.IOException;
 import java.nio.file.ClosedWatchServiceException;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardWatchEventKinds;
 import java.nio.file.WatchEvent;
 import java.nio.file.WatchKey;
 import java.nio.file.WatchService;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -48,6 +53,7 @@ final class FileWatcherThread extends Thread {
 
 	private final Map<WatchKey, Path> watchedDirectories = new HashMap<>();
 	private final Set<Path> changedPaths = new HashSet<>();
+	private final Map<Path, FileSnapshot> lastKnownSnapshots = new HashMap<>();
 	private long nextDirectoryCheckTime;
 
 	FileWatcherThread(String name, Duration quietTime, Duration directoryRecheckInterval) throws IOException {
@@ -110,6 +116,7 @@ final class FileWatcherThread extends Thread {
 		}
 
 		this.callbacks.put(absolutePath, Objects.requireNonNull(callback, "callback"));
+		rememberSnapshot(absolutePath);
 		if (this.directoriesToWatch.add(directory)) {
 			this.nextDirectoryCheckTime = currentTimeMillis.getAsLong();
 		}
@@ -175,10 +182,7 @@ final class FileWatcherThread extends Thread {
 				throw new InterruptedException();
 			}
 			if (event.kind() == StandardWatchEventKinds.OVERFLOW) {
-				// We missed some events, so assume every watched file in the directory has changed.
-				callbacks.keySet().stream()
-					.filter(path -> path.getParent().equals(watchedDirectory))
-					.forEach(changedPaths::add);
+				checkWatchedFilesInDirectoryForChanges(watchedDirectory);
 				break;
 			} else if (event.context() instanceof Path eventPath) {
 				Path fullPath = watchedDirectory.resolve(eventPath)
@@ -186,6 +190,7 @@ final class FileWatcherThread extends Thread {
 					.normalize();
 				if (callbacks.containsKey(fullPath)) {
 					changedPaths.add(fullPath);
+					rememberSnapshot(fullPath);
 				}
 			}
 		}
@@ -194,6 +199,38 @@ final class FileWatcherThread extends Thread {
 			LOGGER.info("Failed to re-watch directory {}. It may have been deleted.", watchedDirectory);
 			watchedDirectories.remove(watchKey);
 		}
+	}
+
+	private void checkWatchedFilesInDirectoryForChanges(Path watchedDirectory) {
+		// We missed some events, so compare the affected directory's watched files
+		// against their last known metadata instead of assuming all of them changed.
+		for (Path path : callbacks.keySet()) {
+			if (path.getParent().equals(watchedDirectory) && rememberSnapshot(path)) {
+				changedPaths.add(path);
+			}
+		}
+	}
+
+	/**
+	 * Records the current metadata snapshot for a watched file.
+	 *
+	 * @param path the watched file path to snapshot
+	 * @return true when the current snapshot differs from the last known snapshot,
+	 * or when the current snapshot cannot be read
+	 */
+	private boolean rememberSnapshot(Path path) {
+		FileSnapshot previousSnapshot = lastKnownSnapshots.get(path);
+		FileSnapshot currentSnapshot;
+		try {
+			currentSnapshot = FileSnapshot.read(path);
+		} catch (IOException e) {
+			LOGGER.debug("Unable to read file metadata for {}, treating it as changed.", path, e);
+			lastKnownSnapshots.remove(path);
+			return true;
+		}
+
+		lastKnownSnapshots.put(path, currentSnapshot);
+		return !currentSnapshot.equals(previousSnapshot);
 	}
 
 	private synchronized void notifyChanges() {
@@ -246,6 +283,51 @@ final class FileWatcherThread extends Thread {
 	@FunctionalInterface
 	interface CallbackExecutor {
 		void execute(List<Runnable> runnables);
+	}
+
+	private record FileSnapshot(
+		boolean exists,
+		boolean regularFile,
+		boolean directory,
+		boolean symbolicLink,
+		long size,
+		FileTime lastModifiedTime,
+		FileTime creationTime,
+		@Nullable Object fileKey
+	) {
+		private static final FileTime MISSING_FILE_TIME = FileTime.fromMillis(0);
+		private static final FileSnapshot MISSING = new FileSnapshot(
+			false,
+			false,
+			false,
+			false,
+			-1,
+			MISSING_FILE_TIME,
+			MISSING_FILE_TIME,
+			null
+		);
+
+		private static FileSnapshot read(Path path) throws IOException {
+			try {
+				BasicFileAttributes attributes = Files.readAttributes(
+					path,
+					BasicFileAttributes.class,
+					LinkOption.NOFOLLOW_LINKS
+				);
+				return new FileSnapshot(
+					true,
+					attributes.isRegularFile(),
+					attributes.isDirectory(),
+					attributes.isSymbolicLink(),
+					attributes.size(),
+					attributes.lastModifiedTime(),
+					attributes.creationTime(),
+					attributes.fileKey()
+				);
+			} catch (NoSuchFileException e) {
+				return MISSING;
+			}
+		}
 	}
 
 	private enum ThreadedCallbackExecutor implements CallbackExecutor {

@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardWatchEventKinds;
 import java.nio.file.WatchEvent;
@@ -242,7 +243,7 @@ class FileWatcherThreadTest {
 	}
 
 	@Test
-	void overflowMarksAllWatchedFilesInTheAffectedDirectory() throws Exception {
+	void overflowMarksChangedWatchedFilesInTheAffectedDirectory() throws Exception {
 		Fixture fixture = new Fixture();
 		FileWatcherThread thread = createThread(fixture);
 		Path firstFile = tempDir.resolve("first.toml");
@@ -253,12 +254,19 @@ class FileWatcherThreadTest {
 		AtomicInteger secondCallbackCount = new AtomicInteger();
 		AtomicInteger otherDirectoryCallbackCount = new AtomicInteger();
 
+		Files.writeString(firstFile, "first");
+		Files.writeString(secondFile, "second");
+		Files.createDirectory(otherDirectory);
+		Files.writeString(otherDirectoryFile, "other");
 		fixture.markDirectoryExists(tempDir);
 		fixture.markDirectoryExists(otherDirectory);
 		thread.addCallback(firstFile, firstCallbackCount::incrementAndGet);
 		thread.addCallback(secondFile, secondCallbackCount::incrementAndGet);
 		thread.addCallback(otherDirectoryFile, otherDirectoryCallbackCount::incrementAndGet);
 		thread.runIteration();
+
+		Files.writeString(firstFile, "first changed");
+		Files.writeString(secondFile, "second changed");
 
 		FakeWatchKey key = fixture.latestKey(tempDir);
 		key.addEvent(overflowEvent());
@@ -271,6 +279,96 @@ class FileWatcherThreadTest {
 		assertEquals(0, otherDirectoryCallbackCount.get());
 		assertEquals(1, fixture.callbackBatches.size());
 		assertEquals(2, fixture.callbackBatches.get(0).size());
+
+		key.addEvent(overflowEvent());
+		fixture.watchService.enqueue(key);
+		thread.runIteration();
+		thread.runIteration();
+
+		assertEquals(1, firstCallbackCount.get());
+		assertEquals(1, secondCallbackCount.get());
+		assertEquals(0, otherDirectoryCallbackCount.get());
+		assertEquals(1, fixture.callbackBatches.size());
+	}
+
+	@Test
+	void overflowSkipsUnchangedWatchedFiles() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedFile = tempDir.resolve("config.toml");
+		AtomicInteger callbackCount = new AtomicInteger();
+
+		Files.writeString(watchedFile, "initial");
+		fixture.markDirectoryExists(tempDir);
+		thread.addCallback(watchedFile, callbackCount::incrementAndGet);
+		thread.runIteration();
+
+		FakeWatchKey key = fixture.latestKey(tempDir);
+		key.addEvent(overflowEvent());
+		fixture.watchService.enqueue(key);
+		thread.runIteration();
+		thread.runIteration();
+
+		assertEquals(0, callbackCount.get());
+		assertEquals(0, fixture.callbackBatches.size());
+	}
+
+	@Test
+	void overflowDetectsCreatedAndDeletedWatchedFiles() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path createdFile = tempDir.resolve("created.toml");
+		Path deletedFile = tempDir.resolve("deleted.toml");
+		AtomicInteger createdCallbackCount = new AtomicInteger();
+		AtomicInteger deletedCallbackCount = new AtomicInteger();
+
+		Files.writeString(deletedFile, "initial");
+		fixture.markDirectoryExists(tempDir);
+		thread.addCallback(createdFile, createdCallbackCount::incrementAndGet);
+		thread.addCallback(deletedFile, deletedCallbackCount::incrementAndGet);
+		thread.runIteration();
+
+		Files.writeString(createdFile, "created");
+		Files.delete(deletedFile);
+
+		FakeWatchKey key = fixture.latestKey(tempDir);
+		key.addEvent(overflowEvent());
+		fixture.watchService.enqueue(key);
+		thread.runIteration();
+		thread.runIteration();
+
+		assertEquals(1, createdCallbackCount.get());
+		assertEquals(1, deletedCallbackCount.get());
+		assertEquals(1, fixture.callbackBatches.size());
+		assertEquals(2, fixture.callbackBatches.get(0).size());
+	}
+
+	@Test
+	void normalEventsUpdateSnapshotsForLaterOverflowChecks() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedFile = tempDir.resolve("config.toml");
+		AtomicInteger callbackCount = new AtomicInteger();
+
+		Files.writeString(watchedFile, "initial");
+		fixture.markDirectoryExists(tempDir);
+		thread.addCallback(watchedFile, callbackCount::incrementAndGet);
+		thread.runIteration();
+
+		Files.writeString(watchedFile, "modified");
+		FakeWatchKey key = fixture.latestKey(tempDir);
+		key.addEvent(pathEvent(StandardWatchEventKinds.ENTRY_MODIFY, watchedFile.getFileName()));
+		fixture.watchService.enqueue(key);
+		thread.runIteration();
+		thread.runIteration();
+
+		key.addEvent(overflowEvent());
+		fixture.watchService.enqueue(key);
+		thread.runIteration();
+		thread.runIteration();
+
+		assertEquals(1, callbackCount.get());
+		assertEquals(1, fixture.callbackBatches.size());
 	}
 
 	@Test
