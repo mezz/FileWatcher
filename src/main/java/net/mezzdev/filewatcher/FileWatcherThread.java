@@ -211,14 +211,17 @@ final class FileWatcherThread extends Thread {
 		}
 
 		List<WatchEvent<?>> events = watchKey.pollEvents();
+		boolean shouldCheckDirectoriesAfterEvents = false;
 		for (WatchEvent<?> event : events) {
 			if (Thread.currentThread().isInterrupted()) {
 				throw new InterruptedException();
 			}
 			if (event.kind() == StandardWatchEventKinds.OVERFLOW) {
 				checkWatchedFilesInDirectoryForChanges(watchedDirectory);
+				shouldCheckDirectoriesAfterEvents = true;
 				break;
 			} else if (event.context() instanceof Path eventPath) {
+				shouldCheckDirectoriesAfterEvents = true;
 				Path fullPath = watchedDirectory.resolve(eventPath)
 					.toAbsolutePath()
 					.normalize();
@@ -232,6 +235,9 @@ final class FileWatcherThread extends Thread {
 		if (!watchKey.reset()) {
 			LOGGER.info("Failed to re-watch directory {}. It may have been deleted.", watchedDirectory);
 			watchedDirectories.remove(watchKey);
+		}
+		if (shouldCheckDirectoriesAfterEvents) {
+			nextDirectoryCheckTime = currentTimeMillis.getAsLong();
 		}
 	}
 
@@ -296,16 +302,29 @@ final class FileWatcherThread extends Thread {
 			if (Thread.currentThread().isInterrupted()) {
 				return;
 			}
-			if (!watchedDirectories.containsValue(directory) &&
-				isDirectory.test(directory)
-			) {
-				try {
-					WatchKey key = directoryRegistrar.register(directory, watchService);
-					watchedDirectories.put(key, directory);
-				} catch (IOException e) {
-					LOGGER.error("Failed to watch directory: {}", directory, e);
+			if (isWatched(directory)) {
+				continue;
+			}
+			if (isDirectory.test(directory)) {
+				if (watchDirectory(directory)) {
+					checkWatchedFilesInDirectoryForChanges(directory);
 				}
 			}
+		}
+	}
+
+	private boolean isWatched(Path directory) {
+		return watchedDirectories.containsValue(directory);
+	}
+
+	private boolean watchDirectory(Path directory) {
+		try {
+			WatchKey key = directoryRegistrar.register(directory, watchService);
+			watchedDirectories.put(key, directory);
+			return true;
+		} catch (IOException e) {
+			LOGGER.error("Failed to watch directory: {}", directory, e);
+			return false;
 		}
 	}
 

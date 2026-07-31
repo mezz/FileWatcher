@@ -8,12 +8,14 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.file.ClosedWatchServiceException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardWatchEventKinds;
 import java.nio.file.WatchEvent;
 import java.nio.file.WatchKey;
 import java.nio.file.WatchService;
 import java.nio.file.Watchable;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -131,6 +133,49 @@ class FileWatcherThreadTest {
 		} finally {
 			thread.shutdown();
 		}
+	}
+
+	@Test
+	void doesNotRegisterParentDirectoryForMissingDirectory() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedDirectory = tempDir.resolve("new-directory");
+		Path watchedFile = watchedDirectory.resolve("config.toml");
+
+		fixture.markDirectoryExists(tempDir);
+		thread.addCallback(watchedFile, () -> {});
+		thread.runIteration();
+
+		fixture.clock.advance(DIRECTORY_RECHECK_INTERVAL);
+		thread.runIteration();
+
+		fixture.clock.advance(DIRECTORY_RECHECK_INTERVAL);
+		thread.runIteration();
+
+		assertEquals(0, fixture.registrationCount(tempDir));
+		assertEquals(0, fixture.registrationCount(watchedDirectory));
+	}
+
+	@Test
+	void directoryRecheckDetectsWatchedFileCreatedBeforeDirectoryRegistration() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedDirectory = tempDir.resolve("new-directory");
+		Path watchedFile = watchedDirectory.resolve("config.toml");
+		AtomicInteger callbackCount = new AtomicInteger();
+
+		thread.addCallback(watchedFile, callbackCount::incrementAndGet);
+		thread.runIteration();
+
+		Files.createDirectory(watchedDirectory);
+		Files.writeString(watchedFile, "created");
+		fixture.markDirectoryExists(watchedDirectory);
+		fixture.clock.advance(DIRECTORY_RECHECK_INTERVAL);
+		thread.runIteration();
+
+		assertEquals(1, fixture.registrationCount(watchedDirectory));
+		assertEquals(1, callbackCount.get());
+		assertEquals(1, fixture.callbackBatches.size());
 	}
 
 	@Test
@@ -456,18 +501,24 @@ class FileWatcherThreadTest {
 	@Test
 	void overflowTreatsUnreadableSnapshotsAsChanged() throws Exception {
 		Fixture fixture = new Fixture();
+		AtomicBoolean metadataUnavailable = new AtomicBoolean();
 		FileWatcherThread thread = createThread(
 			fixture,
 			path -> {
-				throw new IOException("metadata unavailable");
+				if (metadataUnavailable.get()) {
+					throw new IOException("metadata unavailable");
+				}
+				return Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
 			}
 		);
 		Path watchedFile = tempDir.resolve("config.toml");
 		AtomicInteger callbackCount = new AtomicInteger();
 
+		Files.writeString(watchedFile, "initial");
 		fixture.markDirectoryExists(tempDir);
 		thread.addCallback(watchedFile, callbackCount::incrementAndGet);
 		thread.runIteration();
+		metadataUnavailable.set(true);
 
 		FakeWatchKey key = fixture.latestKey(tempDir);
 		key.addEvent(overflowEvent());

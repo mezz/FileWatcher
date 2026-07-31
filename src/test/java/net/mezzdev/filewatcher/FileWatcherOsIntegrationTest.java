@@ -1,14 +1,19 @@
 package net.mezzdev.filewatcher;
 
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.StandardWatchEventKinds;
+import java.nio.file.WatchKey;
+import java.nio.file.WatchService;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -18,6 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 @Timeout(value = 10, unit = TimeUnit.SECONDS)
 class FileWatcherOsIntegrationTest {
@@ -27,6 +33,27 @@ class FileWatcherOsIntegrationTest {
 
 	@TempDir
 	Path tempDir;
+
+	@BeforeAll
+	static void defaultWatchServiceDeliversEvents() throws Exception {
+		Path smokeDirectory = Files.createTempDirectory("filewatcher-watchservice-smoke");
+		Path smokeFile = smokeDirectory.resolve("smoke.txt");
+		try (WatchService watchService = FileSystems.getDefault().newWatchService()) {
+			smokeDirectory.register(
+				watchService,
+				StandardWatchEventKinds.ENTRY_CREATE,
+				StandardWatchEventKinds.ENTRY_MODIFY,
+				StandardWatchEventKinds.ENTRY_DELETE
+			);
+			Files.writeString(smokeFile, "smoke", StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW);
+
+			WatchKey key = watchService.poll(2, TimeUnit.SECONDS);
+			assumeTrue(key != null && !key.pollEvents().isEmpty(), "Default WatchService did not deliver smoke-test events.");
+		} finally {
+			Files.deleteIfExists(smokeFile);
+			Files.deleteIfExists(smokeDirectory);
+		}
+	}
 
 	@Test
 	void defaultWatchServiceDetectsCreatedWatchedFile() throws Exception {
@@ -134,7 +161,6 @@ class FileWatcherOsIntegrationTest {
 			thread.runIteration();
 
 			Files.createDirectory(watchedDirectory);
-			thread.runIteration();
 			writeNewFile(watchedFile, "created");
 
 			runUntilCallback(thread, callbackLatch);
