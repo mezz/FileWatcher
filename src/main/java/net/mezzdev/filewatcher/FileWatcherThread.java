@@ -48,6 +48,7 @@ final class FileWatcherThread extends Thread {
 	private final DirectoryRegistrar directoryRegistrar;
 	private final LongSupplier currentTimeMillis;
 	private final CallbackExecutor callbackExecutor;
+	private final FileAttributesReader fileAttributesReader;
 	private final long quietTimeMillis;
 	private final long directoryRecheckIntervalMillis;
 
@@ -79,6 +80,30 @@ final class FileWatcherThread extends Thread {
 		LongSupplier currentTimeMillis,
 		CallbackExecutor callbackExecutor
 	) {
+		this(
+			name,
+			quietTime,
+			directoryRecheckInterval,
+			watchService,
+			isDirectory,
+			directoryRegistrar,
+			currentTimeMillis,
+			callbackExecutor,
+			FileWatcherThread::readAttributes
+		);
+	}
+
+	FileWatcherThread(
+		String name,
+		Duration quietTime,
+		Duration directoryRecheckInterval,
+		WatchService watchService,
+		Predicate<Path> isDirectory,
+		DirectoryRegistrar directoryRegistrar,
+		LongSupplier currentTimeMillis,
+		CallbackExecutor callbackExecutor,
+		FileAttributesReader fileAttributesReader
+	) {
 		super(Objects.requireNonNull(name, "name"));
 		this.setDaemon(true);
 		this.callbacks = new HashMap<>();
@@ -88,6 +113,7 @@ final class FileWatcherThread extends Thread {
 		this.directoryRegistrar = Objects.requireNonNull(directoryRegistrar, "directoryRegistrar");
 		this.currentTimeMillis = Objects.requireNonNull(currentTimeMillis, "currentTimeMillis");
 		this.callbackExecutor = Objects.requireNonNull(callbackExecutor, "callbackExecutor");
+		this.fileAttributesReader = Objects.requireNonNull(fileAttributesReader, "fileAttributesReader");
 		this.quietTimeMillis = requirePositiveMillis(quietTime, "quietTime");
 		this.directoryRecheckIntervalMillis = requirePositiveMillis(directoryRecheckInterval, "directoryRecheckInterval");
 		this.nextDirectoryCheckTime = currentTimeMillis.getAsLong();
@@ -95,6 +121,14 @@ final class FileWatcherThread extends Thread {
 
 	private static WatchKey registerDirectory(Path directory, WatchService watchService) throws IOException {
 		return directory.register(watchService, WATCH_EVENT_KINDS);
+	}
+
+	private static BasicFileAttributes readAttributes(Path path) throws IOException {
+		return Files.readAttributes(
+			path,
+			BasicFileAttributes.class,
+			LinkOption.NOFOLLOW_LINKS
+		);
 	}
 
 	private static long requirePositiveMillis(Duration duration, String name) {
@@ -222,7 +256,7 @@ final class FileWatcherThread extends Thread {
 		FileSnapshot previousSnapshot = lastKnownSnapshots.get(path);
 		FileSnapshot currentSnapshot;
 		try {
-			currentSnapshot = FileSnapshot.read(path);
+			currentSnapshot = FileSnapshot.read(path, fileAttributesReader);
 		} catch (IOException e) {
 			LOGGER.debug("Unable to read file metadata for {}, treating it as changed.", path, e);
 			lastKnownSnapshots.remove(path);
@@ -285,6 +319,11 @@ final class FileWatcherThread extends Thread {
 		void execute(List<Runnable> runnables);
 	}
 
+	@FunctionalInterface
+	interface FileAttributesReader {
+		BasicFileAttributes read(Path path) throws IOException;
+	}
+
 	private record FileSnapshot(
 		boolean exists,
 		boolean regularFile,
@@ -307,13 +346,9 @@ final class FileWatcherThread extends Thread {
 			null
 		);
 
-		private static FileSnapshot read(Path path) throws IOException {
+		private static FileSnapshot read(Path path, FileAttributesReader fileAttributesReader) throws IOException {
 			try {
-				BasicFileAttributes attributes = Files.readAttributes(
-					path,
-					BasicFileAttributes.class,
-					LinkOption.NOFOLLOW_LINKS
-				);
+				BasicFileAttributes attributes = fileAttributesReader.read(path);
 				return new FileSnapshot(
 					true,
 					attributes.isRegularFile(),

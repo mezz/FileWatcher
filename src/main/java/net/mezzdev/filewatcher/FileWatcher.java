@@ -33,10 +33,20 @@ public final class FileWatcher implements AutoCloseable {
 	}
 
 	FileWatcher(String threadName, Duration quietTime, Duration directoryRecheckInterval) {
+		this(threadName, quietTime, directoryRecheckInterval, FileWatcherThread::new);
+	}
+
+	FileWatcher(
+		String threadName,
+		Duration quietTime,
+		Duration directoryRecheckInterval,
+		WatcherFactory watcherFactory
+	) {
 		this(createWatcher(
 			Objects.requireNonNull(threadName, "threadName"),
 			requirePositiveDuration(quietTime, "quietTime"),
-			requirePositiveDuration(directoryRecheckInterval, "directoryRecheckInterval")
+			requirePositiveDuration(directoryRecheckInterval, "directoryRecheckInterval"),
+			Objects.requireNonNull(watcherFactory, "watcherFactory")
 		));
 	}
 
@@ -47,10 +57,11 @@ public final class FileWatcher implements AutoCloseable {
 	private static @Nullable Watcher createWatcher(
 		String threadName,
 		Duration quietTime,
-		Duration directoryRecheckInterval
+		Duration directoryRecheckInterval,
+		WatcherFactory watcherFactory
 	) {
 		try {
-			return new ThreadWatcher(new FileWatcherThread(threadName, quietTime, directoryRecheckInterval));
+			return new ThreadWatcher(watcherFactory.create(threadName, quietTime, directoryRecheckInterval));
 		} catch (UnsupportedOperationException | IOException e) {
 			LOGGER.error("Unable to create file watcher: ", e);
 			return null;
@@ -105,6 +116,11 @@ public final class FileWatcher implements AutoCloseable {
 		void start();
 
 		void shutdown();
+	}
+
+	@FunctionalInterface
+	interface WatcherFactory {
+		FileWatcherThread create(String threadName, Duration quietTime, Duration directoryRecheckInterval) throws IOException;
 	}
 
 	private record ThreadWatcher(FileWatcherThread thread) implements Watcher {

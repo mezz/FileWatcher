@@ -1,6 +1,7 @@
 package net.mezzdev.filewatcher;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.time.Duration;
@@ -25,10 +26,24 @@ class FileWatcherTest {
 	private static final Path FIRST_PATH = Path.of("config/client.toml");
 	private static final Path SECOND_PATH = Path.of("config/server.toml");
 
+	@TempDir
+	Path tempDir;
+
 	@SuppressWarnings({"DataFlowIssue", "resource"})
 	@Test
 	void rejectsNullPublicConstructorArguments() {
 		assertThrows(NullPointerException.class, () -> new FileWatcher((String) null));
+	}
+
+	@Test
+	void publicConstructorCreatesUsableThreadWatcher() {
+		FileWatcher fileWatcher = new FileWatcher("FileWatcher public constructor test");
+		try {
+			fileWatcher.addCallback(tempDir.resolve("config.toml"), () -> {});
+			fileWatcher.start();
+		} finally {
+			fileWatcher.close();
+		}
 	}
 
 	@SuppressWarnings({"DataFlowIssue", "resource"})
@@ -47,6 +62,12 @@ class FileWatcherTest {
 		assertThrows(NullPointerException.class, () -> new FileWatcher(
 			"test",
 			VALID_QUIET_TIME,
+			null
+		));
+		assertThrows(NullPointerException.class, () -> new FileWatcher(
+			"test",
+			VALID_QUIET_TIME,
+			VALID_DIRECTORY_RECHECK_INTERVAL,
 			null
 		));
 	}
@@ -79,6 +100,24 @@ class FileWatcherTest {
 			VALID_QUIET_TIME,
 			Duration.ofNanos(1)
 		));
+	}
+
+	@Test
+	void watcherFactoryFailureCreatesUnavailableWatcher() {
+		try (FileWatcher fileWatcher = new FileWatcher(
+			"test",
+			VALID_QUIET_TIME,
+			VALID_DIRECTORY_RECHECK_INTERVAL,
+			(threadName, quietTime, directoryRecheckInterval) -> {
+				throw new UnsupportedOperationException("watching is unavailable");
+			}
+		)) {
+			assertDoesNotThrow(() -> {
+				fileWatcher.addCallback(FIRST_PATH, () -> {});
+				fileWatcher.start();
+				fileWatcher.close();
+			});
+		}
 	}
 
 	@SuppressWarnings({"DataFlowIssue"})

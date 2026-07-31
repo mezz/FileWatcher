@@ -5,6 +5,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.nio.file.ClosedWatchServiceException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardWatchEventKinds;
@@ -21,7 +23,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -54,6 +58,17 @@ class FileWatcherThreadTest {
 			fixture::register,
 			fixture.clock::currentTimeMillis,
 			fixture::executeCallbacks
+		));
+		assertThrows(NullPointerException.class, () -> new FileWatcherThread(
+			"test",
+			QUIET_TIME,
+			DIRECTORY_RECHECK_INTERVAL,
+			fixture.watchService,
+			fixture::isDirectory,
+			fixture::register,
+			fixture.clock::currentTimeMillis,
+			fixture::executeCallbacks,
+			null
 		));
 		assertThrows(IllegalArgumentException.class, () -> createThread(
 			fixture,
@@ -99,6 +114,39 @@ class FileWatcherThreadTest {
 		assertEquals(1, fixture.registrationCount(tempDir));
 		assertEquals(QUIET_TIME.toMillis(), fixture.watchService.lastPollTimeout);
 		assertEquals(TimeUnit.MILLISECONDS, fixture.watchService.lastPollUnit);
+	}
+
+	@Test
+	void defaultWatchServiceRegistersExistingDirectory() throws Exception {
+		Path watchedFile = tempDir.resolve("config.toml");
+		FileWatcherThread thread = new FileWatcherThread(
+			"FileWatcherThread default watch service test",
+			QUIET_TIME,
+			DIRECTORY_RECHECK_INTERVAL
+		);
+		try {
+			thread.addCallback(watchedFile, () -> {});
+
+			thread.runIteration();
+		} finally {
+			thread.shutdown();
+		}
+	}
+
+	@Test
+	void doesNotRegisterAlreadyWatchedDirectoryAgainWhenRecheckTimeArrives() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedFile = tempDir.resolve("config.toml");
+
+		fixture.markDirectoryExists(tempDir);
+		thread.addCallback(watchedFile, () -> {});
+		thread.runIteration();
+
+		fixture.clock.advance(DIRECTORY_RECHECK_INTERVAL);
+		thread.runIteration();
+
+		assertEquals(1, fixture.registrationCount(tempDir));
 	}
 
 	@Test
@@ -218,6 +266,40 @@ class FileWatcherThreadTest {
 
 		assertEquals(0, callbackCount.get());
 		assertEquals(0, fixture.callbackBatches.size());
+	}
+
+	@Test
+	void ignoresEventsWithNonPathContext() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedFile = tempDir.resolve("watched.toml");
+		AtomicInteger callbackCount = new AtomicInteger();
+
+		fixture.markDirectoryExists(tempDir);
+		thread.addCallback(watchedFile, callbackCount::incrementAndGet);
+		thread.runIteration();
+
+		FakeWatchKey key = fixture.latestKey(tempDir);
+		key.addEvent(nonPathContextEvent());
+		fixture.watchService.enqueue(key);
+		thread.runIteration();
+		thread.runIteration();
+
+		assertEquals(0, callbackCount.get());
+		assertEquals(0, fixture.callbackBatches.size());
+	}
+
+	@Test
+	void ignoresWatchKeysForUnknownDirectories() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		FakeWatchKey key = new FakeWatchKey(tempDir);
+		key.addEvent(pathEvent(StandardWatchEventKinds.ENTRY_MODIFY, Path.of("config.toml")));
+
+		fixture.watchService.enqueue(key);
+		thread.runIteration();
+
+		assertEquals(0, key.resetCount);
 	}
 
 	@Test
@@ -372,6 +454,32 @@ class FileWatcherThreadTest {
 	}
 
 	@Test
+	void overflowTreatsUnreadableSnapshotsAsChanged() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(
+			fixture,
+			path -> {
+				throw new IOException("metadata unavailable");
+			}
+		);
+		Path watchedFile = tempDir.resolve("config.toml");
+		AtomicInteger callbackCount = new AtomicInteger();
+
+		fixture.markDirectoryExists(tempDir);
+		thread.addCallback(watchedFile, callbackCount::incrementAndGet);
+		thread.runIteration();
+
+		FakeWatchKey key = fixture.latestKey(tempDir);
+		key.addEvent(overflowEvent());
+		fixture.watchService.enqueue(key);
+		thread.runIteration();
+		thread.runIteration();
+
+		assertEquals(1, callbackCount.get());
+		assertEquals(1, fixture.callbackBatches.size());
+	}
+
+	@Test
 	void resetFailureAllowsDirectoryToBeRegisteredAgain() throws Exception {
 		Fixture fixture = new Fixture();
 		FileWatcherThread thread = createThread(fixture);
@@ -397,6 +505,66 @@ class FileWatcherThreadTest {
 	}
 
 	@Test
+	void interruptedEventPollingThrowsInterruptedException() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedFile = tempDir.resolve("config.toml");
+
+		fixture.markDirectoryExists(tempDir);
+		thread.addCallback(watchedFile, () -> {});
+		thread.runIteration();
+
+		FakeWatchKey key = fixture.latestKey(tempDir);
+		key.addEvent(pathEvent(StandardWatchEventKinds.ENTRY_MODIFY, watchedFile.getFileName()));
+		fixture.watchService.enqueue(key);
+
+		Thread.currentThread().interrupt();
+		try {
+			assertThrows(InterruptedException.class, thread::runIteration);
+		} finally {
+			Thread.interrupted();
+		}
+	}
+
+	@Test
+	void interruptedDirectoryWatchDoesNotRegisterDirectories() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedFile = tempDir.resolve("config.toml");
+
+		fixture.markDirectoryExists(tempDir);
+		thread.addCallback(watchedFile, () -> {});
+
+		Thread.currentThread().interrupt();
+		try {
+			thread.runIteration();
+		} finally {
+			Thread.interrupted();
+		}
+
+		assertEquals(0, fixture.registrationCount(tempDir));
+	}
+
+	@Test
+	void registrationFailureAllowsFutureRegistrationAttempt() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedFile = tempDir.resolve("config.toml");
+
+		fixture.markDirectoryExists(tempDir);
+		fixture.registrationException = new IOException("registration failed");
+		thread.addCallback(watchedFile, () -> {});
+		thread.runIteration();
+		assertEquals(0, fixture.registrationCount(tempDir));
+
+		fixture.registrationException = null;
+		fixture.clock.advance(DIRECTORY_RECHECK_INTERVAL);
+		thread.runIteration();
+
+		assertEquals(1, fixture.registrationCount(tempDir));
+	}
+
+	@Test
 	void shutdownInterruptsThreadAndClosesWatchService() {
 		Fixture fixture = new Fixture();
 		FileWatcherThread thread = createThread(fixture);
@@ -408,8 +576,131 @@ class FileWatcherThreadTest {
 		assertEquals(1, fixture.watchService.closeCount);
 	}
 
+	@Test
+	void shutdownIgnoresWatchServiceCloseFailure() {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		fixture.watchService.closeException = new IOException("close failed");
+
+		thread.shutdown();
+
+		assertTrue(thread.isInterrupted());
+		assertTrue(fixture.watchService.closed);
+		assertEquals(1, fixture.watchService.closeCount);
+	}
+
+	@Test
+	void runStopsWhenWatchServiceClosesAndCancelsWatchedDirectories() {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedFile = tempDir.resolve("config.toml");
+
+		fixture.markDirectoryExists(tempDir);
+		thread.addCallback(watchedFile, () -> {});
+		assertDoesNotThrowInterrupted(thread::runIteration);
+		FakeWatchKey key = fixture.latestKey(tempDir);
+
+		fixture.watchService.pollClosed = true;
+		thread.run();
+
+		assertFalse(key.isValid());
+		assertTrue(fixture.watchService.closed);
+		assertEquals(1, fixture.watchService.closeCount);
+	}
+
+	@Test
+	void runStopsWhenInterruptedAndPreservesInterruptStatus() {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		fixture.watchService.pollInterrupted = true;
+
+		try {
+			thread.run();
+
+			assertTrue(Thread.currentThread().isInterrupted());
+			assertTrue(fixture.watchService.closed);
+			assertEquals(1, fixture.watchService.closeCount);
+		} finally {
+			Thread.interrupted();
+		}
+	}
+
+	@Test
+	void runHandlesWatchServiceCloseFailure() {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		fixture.watchService.closeException = new IOException("close failed");
+
+		Thread.currentThread().interrupt();
+		try {
+			thread.run();
+
+			assertTrue(fixture.watchService.closed);
+			assertEquals(1, fixture.watchService.closeCount);
+		} finally {
+			Thread.interrupted();
+		}
+	}
+
+	@Test
+	void runStopsAfterCurrentThreadIsInterruptedDuringIteration() {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		fixture.watchService.interruptAfterPoll = true;
+
+		try {
+			thread.run();
+
+			assertTrue(fixture.watchService.closed);
+			assertEquals(1, fixture.watchService.closeCount);
+		} finally {
+			Thread.interrupted();
+		}
+	}
+
+	@Test
+	void threadedCallbackExecutorRunsCallbacksOnNonDaemonThreadAndContinuesAfterFailure() throws Exception {
+		FileWatcherThread.CallbackExecutor callbackExecutor = threadedCallbackExecutor();
+		CountDownLatch latch = new CountDownLatch(1);
+		AtomicBoolean callbackThreadWasDaemon = new AtomicBoolean(true);
+		AtomicInteger callbackCount = new AtomicInteger();
+
+		callbackExecutor.execute(List.of(
+			() -> {
+				callbackCount.incrementAndGet();
+				throw new IllegalStateException("callback failed");
+			},
+			() -> {
+				callbackThreadWasDaemon.set(Thread.currentThread().isDaemon());
+				callbackCount.incrementAndGet();
+				latch.countDown();
+			}
+		));
+
+		assertTrue(latch.await(5, TimeUnit.SECONDS), "callbacks did not run");
+		assertFalse(callbackThreadWasDaemon.get(), "callbacks should run on a non-daemon thread");
+		assertEquals(2, callbackCount.get());
+	}
+
 	private static FileWatcherThread createThread(Fixture fixture) {
 		return createThread(fixture, "FileWatcherThread test", QUIET_TIME, DIRECTORY_RECHECK_INTERVAL);
+	}
+
+	private static FileWatcherThread createThread(
+		Fixture fixture,
+		FileWatcherThread.FileAttributesReader fileAttributesReader
+	) {
+		return new FileWatcherThread(
+			"FileWatcherThread test",
+			QUIET_TIME,
+			DIRECTORY_RECHECK_INTERVAL,
+			fixture.watchService,
+			fixture::isDirectory,
+			fixture::register,
+			fixture.clock::currentTimeMillis,
+			fixture::executeCallbacks,
+			fileAttributesReader
+		);
 	}
 
 	private static FileWatcherThread createThread(
@@ -428,6 +719,21 @@ class FileWatcherThreadTest {
 			fixture.clock::currentTimeMillis,
 			fixture::executeCallbacks
 		);
+	}
+
+	private static void assertDoesNotThrowInterrupted(ThrowingRunnable runnable) {
+		try {
+			runnable.run();
+		} catch (InterruptedException e) {
+			throw new AssertionError("Unexpected interruption.", e);
+		}
+	}
+
+	private static FileWatcherThread.CallbackExecutor threadedCallbackExecutor() throws Exception {
+		Class<?> executorClass = Class.forName(FileWatcherThread.class.getName() + "$ThreadedCallbackExecutor");
+		Field instanceField = executorClass.getDeclaredField("INSTANCE");
+		instanceField.setAccessible(true);
+		return (FileWatcherThread.CallbackExecutor) instanceField.get(null);
 	}
 
 	private static WatchEvent<Path> pathEvent(WatchEvent.Kind<Path> kind, Path context) {
@@ -468,6 +774,26 @@ class FileWatcherThreadTest {
 		};
 	}
 
+	private static WatchEvent<?> nonPathContextEvent() {
+		return new WatchEvent<>() {
+			@SuppressWarnings({"rawtypes", "unchecked"})
+			@Override
+			public WatchEvent.Kind<Object> kind() {
+				return (WatchEvent.Kind) StandardWatchEventKinds.ENTRY_MODIFY;
+			}
+
+			@Override
+			public int count() {
+				return 1;
+			}
+
+			@Override
+			public String context() {
+				return "config.toml";
+			}
+		};
+	}
+
 	private static Path normalize(Path path) {
 		return path.toAbsolutePath()
 			.normalize();
@@ -479,6 +805,7 @@ class FileWatcherThreadTest {
 		private final Set<Path> existingDirectories = new HashSet<>();
 		private final Map<Path, List<FakeWatchKey>> registrations = new HashMap<>();
 		private final List<List<Runnable>> callbackBatches = new ArrayList<>();
+		private @Nullable IOException registrationException;
 
 		void markDirectoryExists(Path directory) {
 			existingDirectories.add(normalize(directory));
@@ -488,8 +815,11 @@ class FileWatcherThreadTest {
 			return existingDirectories.contains(directory);
 		}
 
-		FakeWatchKey register(Path directory, WatchService watchService) {
+		FakeWatchKey register(Path directory, WatchService watchService) throws IOException {
 			assertSame(this.watchService, watchService);
+			if (registrationException != null) {
+				throw registrationException;
+			}
 			FakeWatchKey key = new FakeWatchKey(directory);
 			registrations.computeIfAbsent(directory, ignored -> new ArrayList<>())
 				.add(key);
@@ -536,6 +866,10 @@ class FileWatcherThreadTest {
 		private long lastPollTimeout;
 		private @Nullable TimeUnit lastPollUnit;
 		private boolean closed;
+		private boolean pollClosed;
+		private boolean pollInterrupted;
+		private boolean interruptAfterPoll;
+		private @Nullable IOException closeException;
 		private int closeCount;
 
 		void enqueue(WatchKey key) {
@@ -548,9 +882,18 @@ class FileWatcherThreadTest {
 		}
 
 		@Override
-		public @Nullable WatchKey poll(long timeout, TimeUnit unit) {
+		public @Nullable WatchKey poll(long timeout, TimeUnit unit) throws InterruptedException {
 			lastPollTimeout = timeout;
 			lastPollUnit = unit;
+			if (pollClosed) {
+				throw new ClosedWatchServiceException();
+			}
+			if (pollInterrupted) {
+				throw new InterruptedException("poll interrupted");
+			}
+			if (interruptAfterPoll) {
+				Thread.currentThread().interrupt();
+			}
 			return keys.poll();
 		}
 
@@ -567,7 +910,15 @@ class FileWatcherThreadTest {
 		public void close() throws IOException {
 			closeCount++;
 			closed = true;
+			if (closeException != null) {
+				throw closeException;
+			}
 		}
+	}
+
+	@FunctionalInterface
+	private interface ThrowingRunnable {
+		void run() throws InterruptedException;
 	}
 
 	private static class FakeWatchKey implements WatchKey {
