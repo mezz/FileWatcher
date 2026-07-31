@@ -1,9 +1,5 @@
 package net.mezzdev.filewatcher;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
-import org.jspecify.annotations.Nullable;
-
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -17,9 +13,7 @@ public final class FileWatcher implements AutoCloseable {
 	static final Duration DEFAULT_QUIET_TIME = Duration.ofMillis(500);
 	static final Duration DEFAULT_DIRECTORY_RECHECK_INTERVAL = Duration.ofMinutes(1);
 
-	private static final Logger LOGGER = LogManager.getLogger(FileWatcher.class);
-
-	private final @Nullable Watcher watcher;
+	private final Watcher watcher;
 	private final AtomicBoolean started = new AtomicBoolean();
 	private final AtomicBoolean closed = new AtomicBoolean();
 
@@ -27,12 +21,13 @@ public final class FileWatcher implements AutoCloseable {
 	 * Creates a file watcher backed by the default filesystem {@link java.nio.file.WatchService}.
 	 *
 	 * @param threadName the name to use for the watcher thread
+	 * @throws FileWatcherUnavailableException when the default filesystem cannot create a usable watcher
 	 */
-	public FileWatcher(String threadName) {
+	public FileWatcher(String threadName) throws FileWatcherUnavailableException {
 		this(Objects.requireNonNull(threadName, "threadName"), DEFAULT_QUIET_TIME, DEFAULT_DIRECTORY_RECHECK_INTERVAL);
 	}
 
-	FileWatcher(String threadName, Duration quietTime, Duration directoryRecheckInterval) {
+	FileWatcher(String threadName, Duration quietTime, Duration directoryRecheckInterval) throws FileWatcherUnavailableException {
 		this(threadName, quietTime, directoryRecheckInterval, FileWatcherThread::new);
 	}
 
@@ -41,7 +36,7 @@ public final class FileWatcher implements AutoCloseable {
 		Duration quietTime,
 		Duration directoryRecheckInterval,
 		WatcherFactory watcherFactory
-	) {
+	) throws FileWatcherUnavailableException {
 		this(createWatcher(
 			Objects.requireNonNull(threadName, "threadName"),
 			requirePositiveDuration(quietTime, "quietTime"),
@@ -50,22 +45,34 @@ public final class FileWatcher implements AutoCloseable {
 		));
 	}
 
-	FileWatcher(@Nullable Watcher watcher) {
-		this.watcher = watcher;
+	FileWatcher(Watcher watcher) {
+		this.watcher = Objects.requireNonNull(watcher, "watcher");
 	}
 
-	private static @Nullable Watcher createWatcher(
+	private static Watcher createWatcher(
 		String threadName,
 		Duration quietTime,
 		Duration directoryRecheckInterval,
 		WatcherFactory watcherFactory
-	) {
+	) throws FileWatcherUnavailableException {
 		try {
-			return new ThreadWatcher(watcherFactory.create(threadName, quietTime, directoryRecheckInterval));
+			return createThreadWatcher(threadName, quietTime, directoryRecheckInterval, watcherFactory);
 		} catch (UnsupportedOperationException | IOException e) {
-			LOGGER.error("Unable to create file watcher: ", e);
-			return null;
+			throw new FileWatcherUnavailableException(
+				"Unable to create a file watcher for the default filesystem. " +
+					"Handle FileWatcherUnavailableException to support platforms without a usable file watcher.",
+				e
+			);
 		}
+	}
+
+	private static Watcher createThreadWatcher(
+		String threadName,
+		Duration quietTime,
+		Duration directoryRecheckInterval,
+		WatcherFactory watcherFactory
+	) throws IOException {
+		return new ThreadWatcher(watcherFactory.create(threadName, quietTime, directoryRecheckInterval));
 	}
 
 	private static Duration requirePositiveDuration(Duration duration, String name) {
@@ -86,7 +93,7 @@ public final class FileWatcher implements AutoCloseable {
 	public void addCallback(Path path, Runnable callback) {
 		Objects.requireNonNull(path, "path");
 		Objects.requireNonNull(callback, "callback");
-		if (watcher != null && !closed.get()) {
+		if (!closed.get()) {
 			watcher.addCallback(path, callback);
 		}
 	}
@@ -95,7 +102,7 @@ public final class FileWatcher implements AutoCloseable {
 	 * Starts watching files. Calling this method more than once has no effect.
 	 */
 	public void start() {
-		if (watcher != null && !closed.get() && started.compareAndSet(false, true)) {
+		if (!closed.get() && started.compareAndSet(false, true)) {
 			watcher.start();
 		}
 	}
@@ -105,7 +112,7 @@ public final class FileWatcher implements AutoCloseable {
 	 */
 	@Override
 	public void close() {
-		if (watcher != null && closed.compareAndSet(false, true)) {
+		if (closed.compareAndSet(false, true)) {
 			watcher.shutdown();
 		}
 	}

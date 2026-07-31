@@ -14,7 +14,6 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -36,7 +35,7 @@ class FileWatcherTest {
 	}
 
 	@Test
-	void publicConstructorCreatesUsableThreadWatcher() {
+	void publicConstructorCreatesUsableThreadWatcher() throws FileWatcherUnavailableException {
 		FileWatcher fileWatcher = new FileWatcher("FileWatcher public constructor test");
 		try {
 			fileWatcher.addCallback(tempDir.resolve("config.toml"), () -> {});
@@ -70,6 +69,7 @@ class FileWatcherTest {
 			VALID_DIRECTORY_RECHECK_INTERVAL,
 			null
 		));
+		assertThrows(NullPointerException.class, () -> new FileWatcher((FileWatcher.Watcher) null));
 	}
 
 	@SuppressWarnings("resource")
@@ -103,36 +103,24 @@ class FileWatcherTest {
 	}
 
 	@Test
-	void watcherFactoryFailureCreatesUnavailableWatcher() {
-		try (FileWatcher fileWatcher = new FileWatcher(
+	void watcherFactoryFailureThrowsUnavailableException() {
+		UnsupportedOperationException cause = new UnsupportedOperationException("watching is unavailable");
+
+		FileWatcherUnavailableException exception = assertThrows(FileWatcherUnavailableException.class, () -> new FileWatcher(
 			"test",
 			VALID_QUIET_TIME,
 			VALID_DIRECTORY_RECHECK_INTERVAL,
 			(threadName, quietTime, directoryRecheckInterval) -> {
-				throw new UnsupportedOperationException("watching is unavailable");
+				throw cause;
 			}
-		)) {
-			assertDoesNotThrow(() -> {
-				fileWatcher.addCallback(FIRST_PATH, () -> {});
-				fileWatcher.start();
-				fileWatcher.close();
-			});
-		}
+		));
+		assertSame(cause, exception.getCause());
 	}
 
 	@SuppressWarnings({"DataFlowIssue"})
 	@Test
 	void rejectsNullCallbackArguments() {
 		try (FileWatcher fileWatcher = createTestWatcher()) {
-			assertThrows(NullPointerException.class, () -> fileWatcher.addCallback(null, () -> {}));
-			assertThrows(NullPointerException.class, () -> fileWatcher.addCallback(FIRST_PATH, null));
-		}
-	}
-
-	@SuppressWarnings({"DataFlowIssue"})
-	@Test
-	void unavailableWatcherStillValidatesCallbackArguments() {
-		try (FileWatcher fileWatcher = unavailableWatcher()) {
 			assertThrows(NullPointerException.class, () -> fileWatcher.addCallback(null, () -> {}));
 			assertThrows(NullPointerException.class, () -> fileWatcher.addCallback(FIRST_PATH, null));
 		}
@@ -295,21 +283,6 @@ class FileWatcherTest {
 	}
 
 	@Test
-	void unavailableWatcherNoOps() {
-		try (FileWatcher fileWatcher = unavailableWatcher()) {
-			assertDoesNotThrow(() -> {
-				fileWatcher.addCallback(FIRST_PATH, () -> {
-				});
-				fileWatcher.start();
-				fileWatcher.start();
-				fileWatcher.close();
-				fileWatcher.close();
-				fileWatcher.start();
-			});
-		}
-	}
-
-	@Test
 	void concurrentStartOnlyStartsWatcherOnce() throws Exception {
 		RecordingWatcher watcher = new RecordingWatcher();
 
@@ -333,10 +306,6 @@ class FileWatcherTest {
 
 	private static FileWatcher createTestWatcher() {
 		return new FileWatcher(new RecordingWatcher());
-	}
-
-	private static FileWatcher unavailableWatcher() {
-		return new FileWatcher((FileWatcher.Watcher) null);
 	}
 
 	private static void runConcurrently(int taskCount, Runnable task) throws Exception {
