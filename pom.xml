@@ -6,7 +6,7 @@
 
     <groupId>net.mezzdev</groupId>
     <artifactId>filewatcher</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0</version>
     <packaging>jar</packaging>
 
     <name>FileWatcher</name>
@@ -32,7 +32,7 @@
         <connection>scm:git:https://github.com/mezz/FileWatcher.git</connection>
         <developerConnection>scm:git:git@github.com:mezz/FileWatcher.git</developerConnection>
         <url>https://github.com/mezz/FileWatcher</url>
-        <tag>v0.1.0</tag>
+        <tag>v0.2.0</tag>
     </scm>
 
     <issueManagement>
