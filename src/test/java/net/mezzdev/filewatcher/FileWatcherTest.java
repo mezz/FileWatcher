@@ -14,14 +14,15 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class FileWatcherTest {
-	private static final Duration VALID_QUIET_TIME = Duration.ofMillis(1);
-	private static final Duration VALID_DIRECTORY_RECHECK_INTERVAL = Duration.ofMillis(1);
+	private static final Duration VALID_CHANGE_SETTLING_DELAY = Duration.ofMillis(1);
+	private static final Duration VALID_MISSING_DIRECTORY_RETRY_INTERVAL = Duration.ofMillis(1);
 	private static final Path FIRST_PATH = Path.of("config/client.toml");
 	private static final Path SECOND_PATH = Path.of("config/server.toml");
 
@@ -32,6 +33,21 @@ class FileWatcherTest {
 	@Test
 	void rejectsNullPublicConstructorArguments() {
 		assertThrows(NullPointerException.class, () -> new FileWatcher((String) null));
+		assertThrows(NullPointerException.class, () -> new FileWatcher(
+			null,
+			VALID_CHANGE_SETTLING_DELAY,
+			VALID_MISSING_DIRECTORY_RETRY_INTERVAL
+		));
+		assertThrows(NullPointerException.class, () -> new FileWatcher(
+			"test",
+			null,
+			VALID_MISSING_DIRECTORY_RETRY_INTERVAL
+		));
+		assertThrows(NullPointerException.class, () -> new FileWatcher(
+			"test",
+			VALID_CHANGE_SETTLING_DELAY,
+			null
+		));
 	}
 
 	@Test
@@ -47,59 +63,71 @@ class FileWatcherTest {
 
 	@SuppressWarnings({"DataFlowIssue", "resource"})
 	@Test
-	void rejectsNullPackageConstructorArguments() {
-		assertThrows(NullPointerException.class, () -> new FileWatcher(
-			null,
-			VALID_QUIET_TIME,
-			VALID_DIRECTORY_RECHECK_INTERVAL
-		));
+	void publicDurationConstructorIsAvailableToLibraryUsers() {
+		assertDoesNotThrow(() -> FileWatcher.class.getConstructor(String.class, Duration.class, Duration.class));
+	}
+
+	@Test
+	void publicDurationConstructorCreatesUsableThreadWatcher() throws FileWatcherUnavailableException {
+		FileWatcher fileWatcher = new FileWatcher(
+			"FileWatcher public duration constructor test",
+			VALID_CHANGE_SETTLING_DELAY,
+			VALID_MISSING_DIRECTORY_RETRY_INTERVAL
+		);
+		try {
+			fileWatcher.addCallback(tempDir.resolve("config.toml"), () -> {});
+			fileWatcher.start();
+		} finally {
+			fileWatcher.close();
+		}
+	}
+
+	@SuppressWarnings({"DataFlowIssue", "resource"})
+	@Test
+	void rejectsNullInternalConstructorArguments() {
 		assertThrows(NullPointerException.class, () -> new FileWatcher(
 			"test",
-			null,
-			VALID_DIRECTORY_RECHECK_INTERVAL
-		));
-		assertThrows(NullPointerException.class, () -> new FileWatcher(
-			"test",
-			VALID_QUIET_TIME,
-			null
-		));
-		assertThrows(NullPointerException.class, () -> new FileWatcher(
-			"test",
-			VALID_QUIET_TIME,
-			VALID_DIRECTORY_RECHECK_INTERVAL,
+			VALID_CHANGE_SETTLING_DELAY,
+			VALID_MISSING_DIRECTORY_RETRY_INTERVAL,
 			null
 		));
 		assertThrows(NullPointerException.class, () -> new FileWatcher((FileWatcher.Watcher) null));
 	}
 
-	@SuppressWarnings("resource")
 	@Test
-	void rejectsQuietTimeShorterThanOneMillisecond() {
-		assertThrows(IllegalArgumentException.class, () -> new FileWatcher(
+	void clampsDurationsToMillisecondBoundsBeforeCreatingWatcherThread() throws FileWatcherUnavailableException {
+		Duration[] capturedDurations = new Duration[2];
+		try (FileWatcher ignored = new FileWatcher(
 			"test",
 			Duration.ZERO,
-			VALID_DIRECTORY_RECHECK_INTERVAL
-		));
-		assertThrows(IllegalArgumentException.class, () -> new FileWatcher(
-			"test",
-			Duration.ofNanos(1),
-			VALID_DIRECTORY_RECHECK_INTERVAL
-		));
+			Duration.ofSeconds(Long.MAX_VALUE),
+			(threadName, changeSettlingDelay, missingDirectoryRetryInterval) -> {
+				capturedDurations[0] = changeSettlingDelay;
+				capturedDurations[1] = missingDirectoryRetryInterval;
+				return new FileWatcherThread(threadName, VALID_CHANGE_SETTLING_DELAY, VALID_MISSING_DIRECTORY_RETRY_INTERVAL);
+			}
+		)) {
+			assertEquals(Duration.ofMillis(1), capturedDurations[0]);
+			assertEquals(Duration.ofMillis(Long.MAX_VALUE), capturedDurations[1]);
+		}
 	}
 
-	@SuppressWarnings("resource")
 	@Test
-	void rejectsDirectoryRecheckIntervalShorterThanOneMillisecond() {
-		assertThrows(IllegalArgumentException.class, () -> new FileWatcher(
+	void clampsNegativeAndSubMillisecondDurationsToOneMillisecond() throws FileWatcherUnavailableException {
+		Duration[] capturedDurations = new Duration[2];
+		try (FileWatcher ignored = new FileWatcher(
 			"test",
-			VALID_QUIET_TIME,
-			Duration.ZERO
-		));
-		assertThrows(IllegalArgumentException.class, () -> new FileWatcher(
-			"test",
-			VALID_QUIET_TIME,
-			Duration.ofNanos(1)
-		));
+			Duration.ofNanos(1),
+			Duration.ofMillis(-1),
+			(threadName, changeSettlingDelay, missingDirectoryRetryInterval) -> {
+				capturedDurations[0] = changeSettlingDelay;
+				capturedDurations[1] = missingDirectoryRetryInterval;
+				return new FileWatcherThread(threadName, VALID_CHANGE_SETTLING_DELAY, VALID_MISSING_DIRECTORY_RETRY_INTERVAL);
+			}
+		)) {
+			assertEquals(Duration.ofMillis(1), capturedDurations[0]);
+			assertEquals(Duration.ofMillis(1), capturedDurations[1]);
+		}
 	}
 
 	@Test
@@ -108,9 +136,9 @@ class FileWatcherTest {
 
 		FileWatcherUnavailableException exception = assertThrows(FileWatcherUnavailableException.class, () -> new FileWatcher(
 			"test",
-			VALID_QUIET_TIME,
-			VALID_DIRECTORY_RECHECK_INTERVAL,
-			(threadName, quietTime, directoryRecheckInterval) -> {
+			VALID_CHANGE_SETTLING_DELAY,
+			VALID_MISSING_DIRECTORY_RETRY_INTERVAL,
+			(threadName, changeSettlingDelay, missingDirectoryRetryInterval) -> {
 				throw cause;
 			}
 		));

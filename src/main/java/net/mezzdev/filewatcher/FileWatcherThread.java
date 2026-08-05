@@ -49,19 +49,19 @@ final class FileWatcherThread extends Thread {
 	private final LongSupplier currentTimeMillis;
 	private final CallbackExecutor callbackExecutor;
 	private final FileAttributesReader fileAttributesReader;
-	private final long quietTimeMillis;
-	private final long directoryRecheckIntervalMillis;
+	private final long changeSettlingDelayMillis;
+	private final long missingDirectoryRetryIntervalMillis;
 
 	private final Map<WatchKey, Path> watchedDirectories = new HashMap<>();
 	private final Set<Path> changedPaths = new HashSet<>();
 	private final Map<Path, FileSnapshot> lastKnownSnapshots = new HashMap<>();
-	private long nextDirectoryCheckTime;
+	private long nextMissingDirectoryRetryTime;
 
-	FileWatcherThread(String name, Duration quietTime, Duration directoryRecheckInterval) throws IOException {
+	FileWatcherThread(String name, Duration changeSettlingDelay, Duration missingDirectoryRetryInterval) throws IOException {
 		this(
 			name,
-			quietTime,
-			directoryRecheckInterval,
+			changeSettlingDelay,
+			missingDirectoryRetryInterval,
 			FileSystems.getDefault().newWatchService(),
 			Files::isDirectory,
 			FileWatcherThread::registerDirectory,
@@ -72,8 +72,8 @@ final class FileWatcherThread extends Thread {
 
 	FileWatcherThread(
 		String name,
-		Duration quietTime,
-		Duration directoryRecheckInterval,
+		Duration changeSettlingDelay,
+		Duration missingDirectoryRetryInterval,
 		WatchService watchService,
 		Predicate<Path> isDirectory,
 		DirectoryRegistrar directoryRegistrar,
@@ -82,8 +82,8 @@ final class FileWatcherThread extends Thread {
 	) {
 		this(
 			name,
-			quietTime,
-			directoryRecheckInterval,
+			changeSettlingDelay,
+			missingDirectoryRetryInterval,
 			watchService,
 			isDirectory,
 			directoryRegistrar,
@@ -95,8 +95,8 @@ final class FileWatcherThread extends Thread {
 
 	FileWatcherThread(
 		String name,
-		Duration quietTime,
-		Duration directoryRecheckInterval,
+		Duration changeSettlingDelay,
+		Duration missingDirectoryRetryInterval,
 		WatchService watchService,
 		Predicate<Path> isDirectory,
 		DirectoryRegistrar directoryRegistrar,
@@ -114,9 +114,9 @@ final class FileWatcherThread extends Thread {
 		this.currentTimeMillis = Objects.requireNonNull(currentTimeMillis, "currentTimeMillis");
 		this.callbackExecutor = Objects.requireNonNull(callbackExecutor, "callbackExecutor");
 		this.fileAttributesReader = Objects.requireNonNull(fileAttributesReader, "fileAttributesReader");
-		this.quietTimeMillis = requirePositiveMillis(quietTime, "quietTime");
-		this.directoryRecheckIntervalMillis = requirePositiveMillis(directoryRecheckInterval, "directoryRecheckInterval");
-		this.nextDirectoryCheckTime = currentTimeMillis.getAsLong();
+		this.changeSettlingDelayMillis = clampToMillis(changeSettlingDelay, "changeSettlingDelay");
+		this.missingDirectoryRetryIntervalMillis = clampToMillis(missingDirectoryRetryInterval, "missingDirectoryRetryInterval");
+		this.nextMissingDirectoryRetryTime = currentTimeMillis.getAsLong();
 	}
 
 	private static WatchKey registerDirectory(Path directory, WatchService watchService) throws IOException {
@@ -131,13 +131,24 @@ final class FileWatcherThread extends Thread {
 		);
 	}
 
-	private static long requirePositiveMillis(Duration duration, String name) {
+	private static long clampToMillis(Duration duration, String name) {
 		Objects.requireNonNull(duration, name);
-		long millis = duration.toMillis();
-		if (millis < 1) {
-			throw new IllegalArgumentException(name + " must be at least 1 millisecond.");
+		if (duration.isNegative() || duration.isZero()) {
+			return 1;
 		}
-		return millis;
+		try {
+			return Math.max(1, duration.toMillis());
+		} catch (ArithmeticException e) {
+			return Long.MAX_VALUE;
+		}
+	}
+
+	private static long saturatingAdd(long value, long positiveIncrement) {
+		long result = value + positiveIncrement;
+		if (result < value) {
+			return Long.MAX_VALUE;
+		}
+		return result;
 	}
 
 	synchronized void addCallback(Path path, Runnable callback) {
@@ -152,7 +163,7 @@ final class FileWatcherThread extends Thread {
 		this.callbacks.put(absolutePath, Objects.requireNonNull(callback, "callback"));
 		rememberSnapshot(absolutePath);
 		if (this.directoriesToWatch.add(directory)) {
-			this.nextDirectoryCheckTime = currentTimeMillis.getAsLong();
+			this.nextMissingDirectoryRetryTime = currentTimeMillis.getAsLong();
 		}
 	}
 
@@ -190,13 +201,13 @@ final class FileWatcherThread extends Thread {
 
 	void runIteration() throws InterruptedException {
 		long time = currentTimeMillis.getAsLong();
-		if (time >= nextDirectoryCheckTime) {
-			nextDirectoryCheckTime = time + directoryRecheckIntervalMillis;
+		if (time >= nextMissingDirectoryRetryTime) {
+			nextMissingDirectoryRetryTime = saturatingAdd(time, missingDirectoryRetryIntervalMillis);
 			watchDirectories();
 		}
 
 		// Collect as many changes as we can, and notify the callbacks when we stop getting new changes.
-		WatchKey watchKey = watchService.poll(quietTimeMillis, TimeUnit.MILLISECONDS);
+		WatchKey watchKey = watchService.poll(changeSettlingDelayMillis, TimeUnit.MILLISECONDS);
 		if (watchKey != null) {
 			pollWatchKey(watchKey);
 		} else {
@@ -237,7 +248,7 @@ final class FileWatcherThread extends Thread {
 			watchedDirectories.remove(watchKey);
 		}
 		if (shouldCheckDirectoriesAfterEvents) {
-			nextDirectoryCheckTime = currentTimeMillis.getAsLong();
+			nextMissingDirectoryRetryTime = currentTimeMillis.getAsLong();
 		}
 	}
 

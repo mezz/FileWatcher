@@ -29,6 +29,19 @@ Runtime.getRuntime().addShutdownHook(new Thread(fileWatcher::close));
 If the current filesystem cannot create a watcher, the constructor throws the
 checked exception `FileWatcherUnavailableException`.
 
+To customize the change-settling delay and missing-directory retry interval,
+pass explicit durations:
+
+```java
+import java.time.Duration;
+
+FileWatcher fileWatcher = new FileWatcher(
+    "config watcher",
+    Duration.ofMillis(250), // changeSettlingDelay
+    Duration.ofSeconds(10)  // missingDirectoryRetryInterval
+);
+```
+
 ## Installation
 
 FileWatcher is published to Maven Central:
@@ -37,7 +50,7 @@ FileWatcher is published to Maven Central:
 <dependency>
     <groupId>net.mezzdev</groupId>
     <artifactId>filewatcher</artifactId>
-    <version>0.2.0</version>
+    <version>0.3.0</version>
 </dependency>
 ```
 

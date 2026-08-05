@@ -37,24 +37,24 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class FileWatcherThreadTest {
-	private static final Duration QUIET_TIME = Duration.ofMillis(10);
-	private static final Duration DIRECTORY_RECHECK_INTERVAL = Duration.ofMillis(100);
+	private static final Duration CHANGE_SETTLING_DELAY = Duration.ofMillis(10);
+	private static final Duration MISSING_DIRECTORY_RETRY_INTERVAL = Duration.ofMillis(100);
 
 	@TempDir
 	Path tempDir;
 
 	@SuppressWarnings({"DataFlowIssue"})
 	@Test
-	void rejectsInvalidConstructorArguments() {
+	void rejectsNullConstructorArguments() {
 		Fixture fixture = new Fixture();
 
-		assertThrows(NullPointerException.class, () -> createThread(fixture, null, QUIET_TIME, DIRECTORY_RECHECK_INTERVAL));
-		assertThrows(NullPointerException.class, () -> createThread(fixture, "test", null, DIRECTORY_RECHECK_INTERVAL));
-		assertThrows(NullPointerException.class, () -> createThread(fixture, "test", QUIET_TIME, null));
+		assertThrows(NullPointerException.class, () -> createThread(fixture, null, CHANGE_SETTLING_DELAY, MISSING_DIRECTORY_RETRY_INTERVAL));
+		assertThrows(NullPointerException.class, () -> createThread(fixture, "test", null, MISSING_DIRECTORY_RETRY_INTERVAL));
+		assertThrows(NullPointerException.class, () -> createThread(fixture, "test", CHANGE_SETTLING_DELAY, null));
 		assertThrows(NullPointerException.class, () -> new FileWatcherThread(
 			"test",
-			QUIET_TIME,
-			DIRECTORY_RECHECK_INTERVAL,
+			CHANGE_SETTLING_DELAY,
+			MISSING_DIRECTORY_RETRY_INTERVAL,
 			null,
 			fixture::isDirectory,
 			fixture::register,
@@ -63,8 +63,8 @@ class FileWatcherThreadTest {
 		));
 		assertThrows(NullPointerException.class, () -> new FileWatcherThread(
 			"test",
-			QUIET_TIME,
-			DIRECTORY_RECHECK_INTERVAL,
+			CHANGE_SETTLING_DELAY,
+			MISSING_DIRECTORY_RETRY_INTERVAL,
 			fixture.watchService,
 			fixture::isDirectory,
 			fixture::register,
@@ -72,24 +72,55 @@ class FileWatcherThreadTest {
 			fixture::executeCallbacks,
 			null
 		));
-		assertThrows(IllegalArgumentException.class, () -> createThread(
-			fixture,
-			"test",
-			Duration.ZERO,
-			DIRECTORY_RECHECK_INTERVAL
-		));
-		assertThrows(IllegalArgumentException.class, () -> createThread(
-			fixture,
+	}
+
+	@Test
+	void clampsChangeSettlingDelayToMillisecondBounds() throws Exception {
+		Fixture shortFixture = new Fixture();
+		FileWatcherThread shortThread = createThread(
+			shortFixture,
 			"test",
 			Duration.ofNanos(1),
-			DIRECTORY_RECHECK_INTERVAL
-		));
-		assertThrows(IllegalArgumentException.class, () -> createThread(
+			MISSING_DIRECTORY_RETRY_INTERVAL
+		);
+
+		shortThread.runIteration();
+
+		assertEquals(1, shortFixture.watchService.lastPollTimeout);
+
+		Fixture giantFixture = new Fixture();
+		FileWatcherThread giantThread = createThread(
+			giantFixture,
+			"test",
+			Duration.ofSeconds(Long.MAX_VALUE),
+			MISSING_DIRECTORY_RETRY_INTERVAL
+		);
+
+		giantThread.runIteration();
+
+		assertEquals(Long.MAX_VALUE, giantFixture.watchService.lastPollTimeout);
+	}
+
+	@Test
+	void clampsMissingDirectoryRetryIntervalBelowOneMillisecondToOneMillisecond() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(
 			fixture,
 			"test",
-			QUIET_TIME,
+			CHANGE_SETTLING_DELAY,
 			Duration.ZERO
-		));
+		);
+		Path watchedDirectory = tempDir.resolve("new-directory");
+		Path watchedFile = watchedDirectory.resolve("config.toml");
+
+		thread.addCallback(watchedFile, () -> {});
+		thread.runIteration();
+		thread.runIteration();
+		assertEquals(1, fixture.directoryCheckCount(watchedDirectory));
+
+		fixture.clock.advance(Duration.ofMillis(1));
+		thread.runIteration();
+		assertEquals(2, fixture.directoryCheckCount(watchedDirectory));
 	}
 
 	@Test
@@ -102,7 +133,7 @@ class FileWatcherThreadTest {
 	}
 
 	@Test
-	void registersExistingDirectoryOnceAndPollsWithQuietTime() throws Exception {
+	void registersExistingDirectoryOnceAndPollsWithChangeSettlingDelay() throws Exception {
 		Fixture fixture = new Fixture();
 		FileWatcherThread thread = createThread(fixture);
 		Path watchedFile = tempDir.resolve("config.toml");
@@ -114,7 +145,7 @@ class FileWatcherThreadTest {
 		thread.runIteration();
 
 		assertEquals(1, fixture.registrationCount(tempDir));
-		assertEquals(QUIET_TIME.toMillis(), fixture.watchService.lastPollTimeout);
+		assertEquals(CHANGE_SETTLING_DELAY.toMillis(), fixture.watchService.lastPollTimeout);
 		assertEquals(TimeUnit.MILLISECONDS, fixture.watchService.lastPollUnit);
 	}
 
@@ -123,8 +154,8 @@ class FileWatcherThreadTest {
 		Path watchedFile = tempDir.resolve("config.toml");
 		FileWatcherThread thread = new FileWatcherThread(
 			"FileWatcherThread default watch service test",
-			QUIET_TIME,
-			DIRECTORY_RECHECK_INTERVAL
+			CHANGE_SETTLING_DELAY,
+			MISSING_DIRECTORY_RETRY_INTERVAL
 		);
 		try {
 			thread.addCallback(watchedFile, () -> {});
@@ -146,10 +177,10 @@ class FileWatcherThreadTest {
 		thread.addCallback(watchedFile, () -> {});
 		thread.runIteration();
 
-		fixture.clock.advance(DIRECTORY_RECHECK_INTERVAL);
+		fixture.clock.advance(MISSING_DIRECTORY_RETRY_INTERVAL);
 		thread.runIteration();
 
-		fixture.clock.advance(DIRECTORY_RECHECK_INTERVAL);
+		fixture.clock.advance(MISSING_DIRECTORY_RETRY_INTERVAL);
 		thread.runIteration();
 
 		assertEquals(0, fixture.registrationCount(tempDir));
@@ -157,7 +188,7 @@ class FileWatcherThreadTest {
 	}
 
 	@Test
-	void directoryRecheckDetectsWatchedFileCreatedBeforeDirectoryRegistration() throws Exception {
+	void missingDirectoryRetryDetectsWatchedFileCreatedBeforeDirectoryRegistration() throws Exception {
 		Fixture fixture = new Fixture();
 		FileWatcherThread thread = createThread(fixture);
 		Path watchedDirectory = tempDir.resolve("new-directory");
@@ -170,7 +201,7 @@ class FileWatcherThreadTest {
 		Files.createDirectory(watchedDirectory);
 		Files.writeString(watchedFile, "created");
 		fixture.markDirectoryExists(watchedDirectory);
-		fixture.clock.advance(DIRECTORY_RECHECK_INTERVAL);
+		fixture.clock.advance(MISSING_DIRECTORY_RETRY_INTERVAL);
 		thread.runIteration();
 
 		assertEquals(1, fixture.registrationCount(watchedDirectory));
@@ -179,7 +210,7 @@ class FileWatcherThreadTest {
 	}
 
 	@Test
-	void doesNotRegisterAlreadyWatchedDirectoryAgainWhenRecheckTimeArrives() throws Exception {
+	void doesNotRegisterAlreadyWatchedDirectoryAgainWhenRetryTimeArrives() throws Exception {
 		Fixture fixture = new Fixture();
 		FileWatcherThread thread = createThread(fixture);
 		Path watchedFile = tempDir.resolve("config.toml");
@@ -188,14 +219,14 @@ class FileWatcherThreadTest {
 		thread.addCallback(watchedFile, () -> {});
 		thread.runIteration();
 
-		fixture.clock.advance(DIRECTORY_RECHECK_INTERVAL);
+		fixture.clock.advance(MISSING_DIRECTORY_RETRY_INTERVAL);
 		thread.runIteration();
 
 		assertEquals(1, fixture.registrationCount(tempDir));
 	}
 
 	@Test
-	void registersDirectoryAfterItAppearsAndRecheckTimeArrives() throws Exception {
+	void registersDirectoryAfterItAppearsAndRetryTimeArrives() throws Exception {
 		Fixture fixture = new Fixture();
 		FileWatcherThread thread = createThread(fixture);
 		Path watchedDirectory = tempDir.resolve("new-directory");
@@ -205,7 +236,7 @@ class FileWatcherThreadTest {
 
 		thread.runIteration();
 		fixture.markDirectoryExists(watchedDirectory);
-		fixture.clock.advance(DIRECTORY_RECHECK_INTERVAL.minusMillis(1));
+		fixture.clock.advance(MISSING_DIRECTORY_RETRY_INTERVAL.minusMillis(1));
 		thread.runIteration();
 		assertEquals(0, fixture.registrationCount(watchedDirectory));
 
@@ -215,7 +246,26 @@ class FileWatcherThreadTest {
 	}
 
 	@Test
-	void defersCallbacksUntilQuietPoll() throws Exception {
+	void largeMissingDirectoryRetryIntervalDoesNotOverflowIntoImmediateRetries() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(
+			fixture,
+			"FileWatcherThread large interval test",
+			CHANGE_SETTLING_DELAY,
+			Duration.ofSeconds(Long.MAX_VALUE)
+		);
+		Path watchedDirectory = tempDir.resolve("new-directory");
+		Path watchedFile = watchedDirectory.resolve("config.toml");
+
+		thread.addCallback(watchedFile, () -> {});
+		thread.runIteration();
+		thread.runIteration();
+
+		assertEquals(1, fixture.directoryCheckCount(watchedDirectory));
+	}
+
+	@Test
+	void defersCallbacksUntilChangeSettlingPoll() throws Exception {
 		Fixture fixture = new Fixture();
 		FileWatcherThread thread = createThread(fixture);
 		Path watchedFile = tempDir.resolve("config.toml");
@@ -547,7 +597,7 @@ class FileWatcherThreadTest {
 		fixture.watchService.enqueue(key);
 		thread.runIteration();
 
-		fixture.clock.advance(DIRECTORY_RECHECK_INTERVAL);
+		fixture.clock.advance(MISSING_DIRECTORY_RETRY_INTERVAL);
 		thread.runIteration();
 
 		assertEquals(2, fixture.registrationCount(tempDir));
@@ -609,7 +659,7 @@ class FileWatcherThreadTest {
 		assertEquals(0, fixture.registrationCount(tempDir));
 
 		fixture.registrationException = null;
-		fixture.clock.advance(DIRECTORY_RECHECK_INTERVAL);
+		fixture.clock.advance(MISSING_DIRECTORY_RETRY_INTERVAL);
 		thread.runIteration();
 
 		assertEquals(1, fixture.registrationCount(tempDir));
@@ -734,7 +784,7 @@ class FileWatcherThreadTest {
 	}
 
 	private static FileWatcherThread createThread(Fixture fixture) {
-		return createThread(fixture, "FileWatcherThread test", QUIET_TIME, DIRECTORY_RECHECK_INTERVAL);
+		return createThread(fixture, "FileWatcherThread test", CHANGE_SETTLING_DELAY, MISSING_DIRECTORY_RETRY_INTERVAL);
 	}
 
 	private static FileWatcherThread createThread(
@@ -743,8 +793,8 @@ class FileWatcherThreadTest {
 	) {
 		return new FileWatcherThread(
 			"FileWatcherThread test",
-			QUIET_TIME,
-			DIRECTORY_RECHECK_INTERVAL,
+			CHANGE_SETTLING_DELAY,
+			MISSING_DIRECTORY_RETRY_INTERVAL,
 			fixture.watchService,
 			fixture::isDirectory,
 			fixture::register,
@@ -757,13 +807,13 @@ class FileWatcherThreadTest {
 	private static FileWatcherThread createThread(
 		Fixture fixture,
 		String name,
-		Duration quietTime,
-		Duration directoryRecheckInterval
+		Duration changeSettlingDelay,
+		Duration missingDirectoryRetryInterval
 	) {
 		return new FileWatcherThread(
 			name,
-			quietTime,
-			directoryRecheckInterval,
+			changeSettlingDelay,
+			missingDirectoryRetryInterval,
 			fixture.watchService,
 			fixture::isDirectory,
 			fixture::register,
@@ -855,6 +905,7 @@ class FileWatcherThreadTest {
 		private final MutableClock clock = new MutableClock(1_000);
 		private final Set<Path> existingDirectories = new HashSet<>();
 		private final Map<Path, List<FakeWatchKey>> registrations = new HashMap<>();
+		private final Map<Path, Integer> directoryCheckCounts = new HashMap<>();
 		private final List<List<Runnable>> callbackBatches = new ArrayList<>();
 		private @Nullable IOException registrationException;
 
@@ -863,6 +914,7 @@ class FileWatcherThreadTest {
 		}
 
 		boolean isDirectory(Path directory) {
+			directoryCheckCounts.merge(directory, 1, Integer::sum);
 			return existingDirectories.contains(directory);
 		}
 
@@ -885,6 +937,10 @@ class FileWatcherThreadTest {
 		int registrationCount(Path directory) {
 			return registrations.getOrDefault(normalize(directory), List.of())
 				.size();
+		}
+
+		int directoryCheckCount(Path directory) {
+			return directoryCheckCounts.getOrDefault(normalize(directory), 0);
 		}
 
 		FakeWatchKey latestKey(Path directory) {

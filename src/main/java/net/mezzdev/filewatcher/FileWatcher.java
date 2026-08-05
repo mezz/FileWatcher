@@ -10,8 +10,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Watches individual files and runs callbacks when those files are created, modified, or deleted.
  */
 public final class FileWatcher implements AutoCloseable {
-	static final Duration DEFAULT_QUIET_TIME = Duration.ofMillis(500);
-	static final Duration DEFAULT_DIRECTORY_RECHECK_INTERVAL = Duration.ofMinutes(1);
+	/**
+	 * The default change-settling delay.
+	 */
+	public static final Duration DEFAULT_CHANGE_SETTLING_DELAY = Duration.ofMillis(500);
+	/**
+	 * The default missing-directory retry interval.
+	 */
+	public static final Duration DEFAULT_MISSING_DIRECTORY_RETRY_INTERVAL = Duration.ofMinutes(1);
 
 	private final Watcher watcher;
 	private final AtomicBoolean started = new AtomicBoolean();
@@ -22,25 +28,41 @@ public final class FileWatcher implements AutoCloseable {
 	 *
 	 * @param threadName the name to use for the watcher thread
 	 * @throws FileWatcherUnavailableException when the default filesystem cannot create a usable watcher
+	 * @see #FileWatcher(String, Duration, Duration)
 	 */
 	public FileWatcher(String threadName) throws FileWatcherUnavailableException {
-		this(Objects.requireNonNull(threadName, "threadName"), DEFAULT_QUIET_TIME, DEFAULT_DIRECTORY_RECHECK_INTERVAL);
+		this(Objects.requireNonNull(threadName, "threadName"), DEFAULT_CHANGE_SETTLING_DELAY, DEFAULT_MISSING_DIRECTORY_RETRY_INTERVAL);
 	}
 
-	FileWatcher(String threadName, Duration quietTime, Duration directoryRecheckInterval) throws FileWatcherUnavailableException {
-		this(threadName, quietTime, directoryRecheckInterval, FileWatcherThread::new);
+	/**
+	 * Creates a file watcher backed by the default filesystem {@link java.nio.file.WatchService}.
+	 *
+	 * @param threadName                    the name to use for the watcher thread
+	 * @param changeSettlingDelay           the time to wait without receiving new events before running callbacks for
+	 *                                      the changed files, coalescing bursts of filesystem events into one callback
+	 *                                      run; values shorter than one millisecond are treated as one millisecond, and
+	 *                                      values too large to fit in long milliseconds are treated as
+	 *                                      {@link Long#MAX_VALUE} milliseconds (~292.3 million years)
+	 * @param missingDirectoryRetryInterval the time between attempts to watch missing parent directories that do not
+	 *                                      exist yet; values shorter than one millisecond are treated as one
+	 *                                      millisecond, and values too large to fit in long milliseconds are treated as
+	 *                                      {@link Long#MAX_VALUE} milliseconds (~292.3 million years)
+	 * @throws FileWatcherUnavailableException when the default filesystem cannot create a usable watcher
+	 */
+	public FileWatcher(String threadName, Duration changeSettlingDelay, Duration missingDirectoryRetryInterval) throws FileWatcherUnavailableException {
+		this(threadName, changeSettlingDelay, missingDirectoryRetryInterval, FileWatcherThread::new);
 	}
 
 	FileWatcher(
 		String threadName,
-		Duration quietTime,
-		Duration directoryRecheckInterval,
+		Duration changeSettlingDelay,
+		Duration missingDirectoryRetryInterval,
 		WatcherFactory watcherFactory
 	) throws FileWatcherUnavailableException {
 		this(createWatcher(
 			Objects.requireNonNull(threadName, "threadName"),
-			requirePositiveDuration(quietTime, "quietTime"),
-			requirePositiveDuration(directoryRecheckInterval, "directoryRecheckInterval"),
+			clampDurationToMillis(changeSettlingDelay, "changeSettlingDelay"),
+			clampDurationToMillis(missingDirectoryRetryInterval, "missingDirectoryRetryInterval"),
 			Objects.requireNonNull(watcherFactory, "watcherFactory")
 		));
 	}
@@ -51,12 +73,12 @@ public final class FileWatcher implements AutoCloseable {
 
 	private static Watcher createWatcher(
 		String threadName,
-		Duration quietTime,
-		Duration directoryRecheckInterval,
+		Duration changeSettlingDelay,
+		Duration missingDirectoryRetryInterval,
 		WatcherFactory watcherFactory
 	) throws FileWatcherUnavailableException {
 		try {
-			return createThreadWatcher(threadName, quietTime, directoryRecheckInterval, watcherFactory);
+			return createThreadWatcher(threadName, changeSettlingDelay, missingDirectoryRetryInterval, watcherFactory);
 		} catch (UnsupportedOperationException | IOException e) {
 			throw new FileWatcherUnavailableException(
 				"Unable to create a file watcher for the default filesystem. " +
@@ -68,19 +90,23 @@ public final class FileWatcher implements AutoCloseable {
 
 	private static Watcher createThreadWatcher(
 		String threadName,
-		Duration quietTime,
-		Duration directoryRecheckInterval,
+		Duration changeSettlingDelay,
+		Duration missingDirectoryRetryInterval,
 		WatcherFactory watcherFactory
 	) throws IOException {
-		return new ThreadWatcher(watcherFactory.create(threadName, quietTime, directoryRecheckInterval));
+		return new ThreadWatcher(watcherFactory.create(threadName, changeSettlingDelay, missingDirectoryRetryInterval));
 	}
 
-	private static Duration requirePositiveDuration(Duration duration, String name) {
+	private static Duration clampDurationToMillis(Duration duration, String name) {
 		Objects.requireNonNull(duration, name);
-		if (duration.toMillis() < 1) {
-			throw new IllegalArgumentException(name + " must be at least 1 millisecond.");
+		if (duration.isNegative() || duration.isZero()) {
+			return Duration.ofMillis(1);
 		}
-		return duration;
+		try {
+			return Duration.ofMillis(Math.max(1, duration.toMillis()));
+		} catch (ArithmeticException e) {
+			return Duration.ofMillis(Long.MAX_VALUE);
+		}
 	}
 
 	/**
@@ -127,7 +153,7 @@ public final class FileWatcher implements AutoCloseable {
 
 	@FunctionalInterface
 	interface WatcherFactory {
-		FileWatcherThread create(String threadName, Duration quietTime, Duration directoryRecheckInterval) throws IOException;
+		FileWatcherThread create(String threadName, Duration changeSettlingDelay, Duration missingDirectoryRetryInterval) throws IOException;
 	}
 
 	private record ThreadWatcher(FileWatcherThread thread) implements Watcher {

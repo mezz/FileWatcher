@@ -27,8 +27,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 @Timeout(value = 10, unit = TimeUnit.SECONDS)
 class FileWatcherOsIntegrationTest {
-	private static final Duration QUIET_TIME = Duration.ofMillis(25);
-	private static final Duration DIRECTORY_RECHECK_INTERVAL = Duration.ofMillis(1);
+	private static final Duration CHANGE_SETTLING_DELAY = Duration.ofMillis(25);
+	private static final Duration MISSING_DIRECTORY_RETRY_INTERVAL = Duration.ofMillis(1);
 	private static final Duration EVENT_TIMEOUT = Duration.ofSeconds(5);
 
 	@TempDir
@@ -203,8 +203,8 @@ class FileWatcherOsIntegrationTest {
 
 		try (FileWatcher fileWatcher = new FileWatcher(
 			"FileWatcher OS integration test",
-			QUIET_TIME,
-			DIRECTORY_RECHECK_INTERVAL
+			CHANGE_SETTLING_DELAY,
+			MISSING_DIRECTORY_RETRY_INTERVAL
 		)) {
 			fileWatcher.addCallback(watchedFile, callbackLatch::countDown);
 			fileWatcher.start();
@@ -214,7 +214,7 @@ class FileWatcherOsIntegrationTest {
 	}
 
 	private static FileWatcherThread createThread() throws IOException {
-		return new FileWatcherThread("FileWatcher OS integration test", QUIET_TIME, DIRECTORY_RECHECK_INTERVAL);
+		return new FileWatcherThread("FileWatcher OS integration test", CHANGE_SETTLING_DELAY, MISSING_DIRECTORY_RETRY_INTERVAL);
 	}
 
 	private static void runUntilCallback(FileWatcherThread thread, CountDownLatch callbackLatch) throws Exception {
