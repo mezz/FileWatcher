@@ -59,7 +59,7 @@ FileWatcher is published to Maven Central:
 <dependency>
     <groupId>net.mezzdev</groupId>
     <artifactId>filewatcher</artifactId>
-    <version>0.3.0</version>
+    <version>0.4.0</version>
 </dependency>
 ```
 
