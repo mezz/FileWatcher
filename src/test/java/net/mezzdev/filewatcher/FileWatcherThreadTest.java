@@ -133,6 +133,140 @@ class FileWatcherThreadTest {
 	}
 
 	@Test
+	void unsubscribeBeforeWatchingPreventsDirectoryRegistration() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedFile = tempDir.resolve("config.toml");
+
+		fixture.markDirectoryExists(tempDir);
+		Runnable unsubscribe = thread.addCallback(watchedFile, () -> {});
+		unsubscribe.run();
+		unsubscribe.run();
+		thread.runIteration();
+
+		assertEquals(0, fixture.registrationCount(tempDir));
+		assertEquals(0, fixture.directoryCheckCount(tempDir));
+	}
+
+	@Test
+	void unsubscribeRemovesPendingCallbackAndUnusedDirectoryWatch() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedFile = tempDir.resolve("config.toml");
+		AtomicInteger callbackCount = new AtomicInteger();
+
+		fixture.markDirectoryExists(tempDir);
+		Runnable unsubscribe = thread.addCallback(watchedFile, callbackCount::incrementAndGet);
+		thread.runIteration();
+
+		FakeWatchKey key = fixture.latestKey(tempDir);
+		key.addEvent(pathEvent(StandardWatchEventKinds.ENTRY_MODIFY, watchedFile.getFileName()));
+		fixture.watchService.enqueue(key);
+		thread.runIteration();
+
+		unsubscribe.run();
+		unsubscribe.run();
+		thread.runIteration();
+
+		assertEquals(0, callbackCount.get());
+		assertEquals(0, fixture.callbackBatches.size());
+		assertFalse(key.isValid());
+
+		fixture.clock.advance(MISSING_DIRECTORY_RETRY_INTERVAL);
+		thread.runIteration();
+		assertEquals(1, fixture.directoryCheckCount(tempDir));
+	}
+
+	@Test
+	void notifiesAllCallbacksRegisteredForSamePath() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedFile = tempDir.resolve("config.toml");
+		AtomicInteger firstCallbackCount = new AtomicInteger();
+		AtomicInteger secondCallbackCount = new AtomicInteger();
+
+		fixture.markDirectoryExists(tempDir);
+		thread.addCallback(watchedFile, firstCallbackCount::incrementAndGet);
+		thread.addCallback(watchedFile, secondCallbackCount::incrementAndGet);
+		thread.runIteration();
+		FakeWatchKey key = fixture.latestKey(tempDir);
+
+		key.addEvent(pathEvent(StandardWatchEventKinds.ENTRY_MODIFY, watchedFile.getFileName()));
+		fixture.watchService.enqueue(key);
+		thread.runIteration();
+		thread.runIteration();
+
+		assertEquals(1, firstCallbackCount.get());
+		assertEquals(1, secondCallbackCount.get());
+		assertEquals(1, fixture.callbackBatches.size());
+		assertEquals(2, fixture.callbackBatches.get(0).size());
+	}
+
+	@Test
+	void unsubscribeRemovesOnlyExactRegistrationForSamePath() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedFile = tempDir.resolve("config.toml");
+		AtomicInteger callbackCount = new AtomicInteger();
+		Runnable callback = callbackCount::incrementAndGet;
+
+		fixture.markDirectoryExists(tempDir);
+		Runnable firstUnsubscribe = thread.addCallback(watchedFile, callback);
+		Runnable secondUnsubscribe = thread.addCallback(watchedFile, callback);
+		thread.runIteration();
+		FakeWatchKey key = fixture.latestKey(tempDir);
+
+		key.addEvent(pathEvent(StandardWatchEventKinds.ENTRY_MODIFY, watchedFile.getFileName()));
+		fixture.watchService.enqueue(key);
+		thread.runIteration();
+		firstUnsubscribe.run();
+		firstUnsubscribe.run();
+		thread.runIteration();
+
+		assertEquals(1, callbackCount.get());
+		assertEquals(1, fixture.callbackBatches.size());
+		assertEquals(1, fixture.callbackBatches.get(0).size());
+		assertTrue(key.isValid());
+
+		secondUnsubscribe.run();
+		assertFalse(key.isValid());
+	}
+
+	@Test
+	void unsubscribeKeepsPathAndDirectoryWatchUntilLastListenerIsRemoved() throws Exception {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Path watchedFile = tempDir.resolve("config.toml");
+
+		fixture.markDirectoryExists(tempDir);
+		Runnable firstUnsubscribe = thread.addCallback(watchedFile, () -> {});
+		Runnable secondUnsubscribe = thread.addCallback(watchedFile, () -> {});
+		thread.runIteration();
+		FakeWatchKey key = fixture.latestKey(tempDir);
+
+		firstUnsubscribe.run();
+		assertTrue(key.isValid());
+
+		secondUnsubscribe.run();
+		assertFalse(key.isValid());
+	}
+
+	@Test
+	void unsubscribeIsSafeAfterShutdown() {
+		Fixture fixture = new Fixture();
+		FileWatcherThread thread = createThread(fixture);
+		Runnable unsubscribe = thread.addCallback(tempDir.resolve("config.toml"), () -> {});
+
+		thread.shutdown();
+
+		unsubscribe.run();
+		unsubscribe.run();
+		Runnable afterShutdownUnsubscribe = thread.addCallback(tempDir.resolve("other.toml"), () -> {});
+		afterShutdownUnsubscribe.run();
+		afterShutdownUnsubscribe.run();
+	}
+
+	@Test
 	void registersExistingDirectoryOnceAndPollsWithChangeSettlingDelay() throws Exception {
 		Fixture fixture = new Fixture();
 		FileWatcherThread thread = createThread(fixture);

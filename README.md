@@ -18,13 +18,22 @@ try {
     return;
 }
 
-fileWatcher.addCallback(Path.of("config/client.toml"), () -> {
+Runnable unsubscribe = fileWatcher.addCallback(Path.of("config/client.toml"), () -> {
     // Reload the file here.
 });
 fileWatcher.start();
 
+// When this file is no longer relevant:
+unsubscribe.run();
+
 Runtime.getRuntime().addShutdownHook(new Thread(fileWatcher::close));
 ```
+
+Calling the returned unsubscribe callback more than once is safe. It removes
+only its own registration. Multiple callbacks can be registered for the same
+path, including multiple registrations of the same callback object.
+Registration and unsubscription are safe before or after `start()`, and
+unsubscribe callbacks remain safe after the watcher is closed.
 
 If the current filesystem cannot create a watcher, the constructor throws the
 checked exception `FileWatcherUnavailableException`.

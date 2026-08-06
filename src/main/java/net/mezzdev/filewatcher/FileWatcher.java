@@ -4,12 +4,13 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Objects;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Watches individual files and runs callbacks when those files are created, modified, or deleted.
  */
 public final class FileWatcher implements AutoCloseable {
+	private static final Runnable NO_OP = () -> {};
+
 	/**
 	 * The default change-settling delay.
 	 */
@@ -20,8 +21,8 @@ public final class FileWatcher implements AutoCloseable {
 	public static final Duration DEFAULT_MISSING_DIRECTORY_RETRY_INTERVAL = Duration.ofMinutes(1);
 
 	private final Watcher watcher;
-	private final AtomicBoolean started = new AtomicBoolean();
-	private final AtomicBoolean closed = new AtomicBoolean();
+	private boolean started;
+	private boolean closed;
 
 	/**
 	 * Creates a file watcher backed by the default filesystem {@link java.nio.file.WatchService}.
@@ -110,25 +111,29 @@ public final class FileWatcher implements AutoCloseable {
 	}
 
 	/**
-	 * Adds or replaces the callback for a file.
+	 * Adds a callback for a file. Multiple callbacks may be registered for the same file.
 	 *
 	 * @param path     the file to watch
 	 * @param callback the callback to call when the file changes.
 	 *                 Callbacks must be thread-safe; they run from a callback runner thread.
+	 * @return an idempotent callback that removes only this registration. It has no effect if this registration has
+	 * already been removed.
 	 */
-	public void addCallback(Path path, Runnable callback) {
+	public synchronized Runnable addCallback(Path path, Runnable callback) {
 		Objects.requireNonNull(path, "path");
 		Objects.requireNonNull(callback, "callback");
-		if (!closed.get()) {
-			watcher.addCallback(path, callback);
+		if (closed) {
+			return NO_OP;
 		}
+		return watcher.addCallback(path, callback);
 	}
 
 	/**
 	 * Starts watching files. Calling this method more than once has no effect.
 	 */
-	public void start() {
-		if (!closed.get() && started.compareAndSet(false, true)) {
+	public synchronized void start() {
+		if (!closed && !started) {
+			started = true;
 			watcher.start();
 		}
 	}
@@ -137,14 +142,15 @@ public final class FileWatcher implements AutoCloseable {
 	 * Stops the watcher thread. Calling this method more than once has no effect.
 	 */
 	@Override
-	public void close() {
-		if (closed.compareAndSet(false, true)) {
+	public synchronized void close() {
+		if (!closed) {
+			closed = true;
 			watcher.shutdown();
 		}
 	}
 
 	interface Watcher {
-		void addCallback(Path path, Runnable callback);
+		Runnable addCallback(Path path, Runnable callback);
 
 		void start();
 
@@ -162,8 +168,8 @@ public final class FileWatcher implements AutoCloseable {
 		}
 
 		@Override
-		public void addCallback(Path path, Runnable callback) {
-			thread.addCallback(path, callback);
+		public Runnable addCallback(Path path, Runnable callback) {
+			return thread.addCallback(path, callback);
 		}
 
 		@Override

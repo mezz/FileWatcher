@@ -18,6 +18,7 @@ import java.nio.file.WatchService;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -25,6 +26,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -34,6 +36,7 @@ import java.util.stream.Collectors;
  */
 final class FileWatcherThread extends Thread {
 	private static final Logger LOGGER = LogManager.getLogger(FileWatcherThread.class);
+	private static final Runnable NO_OP = () -> {};
 	private static final WatchEvent.Kind<?>[] WATCH_EVENT_KINDS = {
 		StandardWatchEventKinds.ENTRY_DELETE,
 		StandardWatchEventKinds.ENTRY_CREATE,
@@ -42,7 +45,7 @@ final class FileWatcherThread extends Thread {
 	};
 
 	private final WatchService watchService;
-	private final Map<Path, Runnable> callbacks;
+	private final Map<Path, List<CallbackRegistration>> callbacks;
 	private final Set<Path> directoriesToWatch;
 	private final Predicate<Path> isDirectory;
 	private final DirectoryRegistrar directoryRegistrar;
@@ -56,6 +59,7 @@ final class FileWatcherThread extends Thread {
 	private final Set<Path> changedPaths = new HashSet<>();
 	private final Map<Path, FileSnapshot> lastKnownSnapshots = new HashMap<>();
 	private long nextMissingDirectoryRetryTime;
+	private boolean shutdown;
 
 	FileWatcherThread(String name, Duration changeSettlingDelay, Duration missingDirectoryRetryInterval) throws IOException {
 		this(
@@ -151,7 +155,7 @@ final class FileWatcherThread extends Thread {
 		return result;
 	}
 
-	synchronized void addCallback(Path path, Runnable callback) {
+	synchronized Runnable addCallback(Path path, Runnable callback) {
 		Path absolutePath = Objects.requireNonNull(path, "path")
 			.toAbsolutePath()
 			.normalize();
@@ -160,10 +164,53 @@ final class FileWatcherThread extends Thread {
 			throw new IllegalArgumentException("Watched path must have a parent directory: " + path);
 		}
 
-		this.callbacks.put(absolutePath, Objects.requireNonNull(callback, "callback"));
-		rememberSnapshot(absolutePath);
+		CallbackRegistration registration = new CallbackRegistration(Objects.requireNonNull(callback, "callback"));
+		if (shutdown) {
+			return NO_OP;
+		}
+
+		List<CallbackRegistration> pathCallbacks = this.callbacks.computeIfAbsent(absolutePath, ignored -> {
+			rememberSnapshot(absolutePath);
+			return new ArrayList<>();
+		});
+		pathCallbacks.add(registration);
 		if (this.directoriesToWatch.add(directory)) {
 			this.nextMissingDirectoryRetryTime = currentTimeMillis.getAsLong();
+		}
+
+		AtomicBoolean unsubscribed = new AtomicBoolean();
+		return () -> {
+			if (unsubscribed.compareAndSet(false, true)) {
+				removeCallback(absolutePath, registration);
+			}
+		};
+	}
+
+	private synchronized void removeCallback(Path path, CallbackRegistration registration) {
+		List<CallbackRegistration> pathCallbacks = callbacks.get(path);
+		if (pathCallbacks == null || !pathCallbacks.removeIf(pathCallback -> pathCallback == registration)) {
+			return;
+		}
+		if (!pathCallbacks.isEmpty()) {
+			return;
+		}
+
+		callbacks.remove(path);
+		changedPaths.remove(path);
+		lastKnownSnapshots.remove(path);
+
+		Path directory = Objects.requireNonNull(path.getParent());
+		boolean directoryStillUsed = callbacks.keySet().stream()
+			.anyMatch(callbackPath -> directory.equals(callbackPath.getParent()));
+		if (!directoryStillUsed) {
+			directoriesToWatch.remove(directory);
+			watchedDirectories.entrySet().removeIf(entry -> {
+				if (directory.equals(entry.getValue())) {
+					entry.getKey().cancel();
+					return true;
+				}
+				return false;
+			});
 		}
 	}
 
@@ -182,21 +229,35 @@ final class FileWatcherThread extends Thread {
 			LOGGER.error("FileWatcher encountered an unhandled IOException, stopping.", e);
 		} finally {
 			synchronized (this) {
-				watchedDirectories
-					.keySet()
-					.forEach(WatchKey::cancel);
-				watchedDirectories.clear();
+				shutdown = true;
+				clearRegistrations();
 			}
 		}
 	}
 
-	void shutdown() {
+	synchronized void shutdown() {
+		if (shutdown) {
+			return;
+		}
+		shutdown = true;
+		clearRegistrations();
 		interrupt();
 		try {
 			watchService.close();
 		} catch (IOException e) {
 			LOGGER.debug("Failed to close FileWatcher watch service.", e);
 		}
+	}
+
+	private void clearRegistrations() {
+		callbacks.clear();
+		directoriesToWatch.clear();
+		changedPaths.clear();
+		lastKnownSnapshots.clear();
+		watchedDirectories
+			.keySet()
+			.forEach(WatchKey::cancel);
+		watchedDirectories.clear();
 	}
 
 	void runIteration() throws InterruptedException {
@@ -298,6 +359,8 @@ final class FileWatcherThread extends Thread {
 		List<Runnable> runnables = changedPaths.stream()
 			.map(callbacks::get)
 			.filter(Objects::nonNull)
+			.flatMap(List::stream)
+			.map(CallbackRegistration::callback)
 			.toList();
 
 		changedPaths.clear();
@@ -336,6 +399,12 @@ final class FileWatcherThread extends Thread {
 		} catch (IOException e) {
 			LOGGER.error("Failed to watch directory: {}", directory, e);
 			return false;
+		}
+	}
+
+	private record CallbackRegistration(Runnable callback) {
+		private CallbackRegistration {
+			Objects.requireNonNull(callback, "callback");
 		}
 	}
 

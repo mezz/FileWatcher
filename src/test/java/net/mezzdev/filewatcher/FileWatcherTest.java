@@ -158,13 +158,23 @@ class FileWatcherTest {
 	void addCallbackForwardsToWatcher() {
 		RecordingWatcher watcher = new RecordingWatcher();
 		Runnable callback = () -> {};
+		Runnable unsubscribe;
 
 		try (FileWatcher fileWatcher = new FileWatcher(watcher)) {
-			fileWatcher.addCallback(FIRST_PATH, callback);
+			unsubscribe = fileWatcher.addCallback(FIRST_PATH, callback);
 		}
 
 		assertEquals(List.of(FIRST_PATH), watcher.paths);
 		assertSame(callback, watcher.callbacks.get(0));
+		assertSame(watcher.unsubscribeCallbacks.get(0), unsubscribe);
+	}
+
+	@Test
+	void addCallbackReturnsRunnableToLibraryUsers() throws NoSuchMethodException {
+		assertSame(
+			Runnable.class,
+			FileWatcher.class.getMethod("addCallback", Path.class, Runnable.class).getReturnType()
+		);
 	}
 
 	@Test
@@ -205,11 +215,26 @@ class FileWatcherTest {
 
 		FileWatcher fileWatcher = new FileWatcher(watcher);
 		fileWatcher.close();
-		fileWatcher.addCallback(FIRST_PATH, callback);
+		Runnable unsubscribe = fileWatcher.addCallback(FIRST_PATH, callback);
+		unsubscribe.run();
+		unsubscribe.run();
 
 		assertEquals(List.of(), watcher.paths);
 		assertEquals(List.of(), watcher.callbacks);
 		assertEquals(1, watcher.shutdownCount());
+	}
+
+	@Test
+	void unsubscribeReturnedBeforeCloseRemainsSafeAfterClose() {
+		RecordingWatcher watcher = new RecordingWatcher();
+		FileWatcher fileWatcher = new FileWatcher(watcher);
+		Runnable unsubscribe = fileWatcher.addCallback(FIRST_PATH, () -> {});
+
+		fileWatcher.close();
+
+		assertDoesNotThrow(unsubscribe::run);
+		assertDoesNotThrow(unsubscribe::run);
+		assertEquals(1, watcher.unsubscribeCount());
 	}
 
 	@Test
@@ -365,13 +390,23 @@ class FileWatcherTest {
 	private static class RecordingWatcher implements FileWatcher.Watcher {
 		private final List<Path> paths = new ArrayList<>();
 		private final List<Runnable> callbacks = new ArrayList<>();
+		private final List<Runnable> unsubscribeCallbacks = new ArrayList<>();
 		private final AtomicInteger startCount = new AtomicInteger();
 		private final AtomicInteger shutdownCount = new AtomicInteger();
+		private final AtomicInteger unsubscribeCount = new AtomicInteger();
 
 		@Override
-		public void addCallback(Path path, Runnable callback) {
+		public Runnable addCallback(Path path, Runnable callback) {
 			paths.add(path);
 			callbacks.add(callback);
+			AtomicInteger calls = new AtomicInteger();
+			Runnable unsubscribe = () -> {
+				if (calls.getAndIncrement() == 0) {
+					unsubscribeCount.incrementAndGet();
+				}
+			};
+			unsubscribeCallbacks.add(unsubscribe);
+			return unsubscribe;
 		}
 
 		@Override
@@ -390,6 +425,10 @@ class FileWatcherTest {
 
 		int shutdownCount() {
 			return shutdownCount.get();
+		}
+
+		int unsubscribeCount() {
+			return unsubscribeCount.get();
 		}
 	}
 }
